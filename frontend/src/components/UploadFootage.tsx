@@ -30,6 +30,9 @@ const BOX_COLORS = [
   "#8E24AA", "#00ACC1", "#F4511E", "#039BE5",
 ];
 
+const BEV_MAX_DIST = 100;  // meters forward
+const BEV_HALF_WIDTH = 8;  // meters each side
+
 const btnStyle: React.CSSProperties = {
   padding: "0.3rem 0.7rem",
   border: "1px solid #ccc",
@@ -70,6 +73,28 @@ function estimateDistance(
   const beta = Math.atan((yBase - cy) / fx);
   const d = params.camera_height_m / Math.tan(beta + pitchRad);
   return d > 0 && isFinite(d) && d < 500 ? Math.round(d * 10) / 10 : null;
+}
+
+/**
+ * Back-project an image pixel to world ground-plane coordinates.
+ * Returns { X: lateral metres (right+), Z: forward metres } or null if above horizon.
+ */
+function imageToWorld(
+  u: number, v: number,
+  videoW: number, videoH: number,
+  params: CameraParams,
+): { X: number; Z: number } | null {
+  if (!params.fx || !params.image_width || !videoW || !videoH) return null;
+  const fxScaled = params.fx * (videoW / params.image_width);
+  const cx = videoW / 2;
+  const cy = videoH / 2;
+  const pitchRad = params.pitch_degrees * (Math.PI / 180);
+  const beta = Math.atan((v - cy) / fxScaled);
+  const angle = beta + pitchRad;
+  if (Math.tan(angle) <= 0) return null;  // point above or on horizon
+  const Z = params.camera_height_m / Math.tan(angle);
+  const X = (u - cx) * Z / fxScaled;
+  return { X, Z };
 }
 
 /** Compute letterbox transform for object-fit:contain video inside a canvas. */
@@ -151,6 +176,100 @@ function drawOverlay(
 }
 
 // ---------------------------------------------------------------------------
+// Bird's Eye View drawing
+// ---------------------------------------------------------------------------
+
+function drawBEV(
+  bevCanvas: HTMLCanvasElement,
+  frame: FrameEntry | null,
+  params: CameraParams,
+  videoW: number,
+  videoH: number,
+) {
+  const ctx = bevCanvas.getContext("2d")!;
+  const W = bevCanvas.width;
+  const H = bevCanvas.height;
+  if (!W || !H) return;
+
+  // Pixels per metre – fit BEV_MAX_DIST vertically and BEV_HALF_WIDTH*2 horizontally
+  const scaleZ = H / BEV_MAX_DIST;
+  const scaleX = (W / 2) / BEV_HALF_WIDTH;
+  const ppm = Math.min(scaleZ, scaleX);  // pixels per metre
+
+  const cxBEV = W / 2;
+
+  function worldToBEV(X: number, Z: number): [number, number] {
+    return [cxBEV + X * ppm, H - Z * ppm];
+  }
+
+  // Background
+  ctx.fillStyle = "#464646";
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.lineWidth = 1;
+  ctx.font = "11px system-ui";
+  ctx.textAlign = "left";
+
+  // Centre (forward) line
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.beginPath();
+  ctx.moveTo(cxBEV, H);
+  ctx.lineTo(cxBEV, 0);
+  ctx.stroke();
+
+  // Distance rings
+  for (let z = 5; z <= BEV_MAX_DIST; z += 5) {
+    const [, gy] = worldToBEV(0, z);
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(W, gy);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillText(`${z}m`, cxBEV + 4, gy - 3);
+  }
+
+  if (!frame || !videoW || !videoH) return;
+
+  // ── Lane lines ──
+  ctx.strokeStyle = "#FFD700";
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  for (const line of frame.lane_lines) {
+    const pts = line
+      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
+      .filter(Boolean) as { X: number; Z: number }[];
+    if (pts.length < 2) continue;
+    ctx.beginPath();
+    const [bx0, by0] = worldToBEV(pts[0].X, pts[0].Z);
+    ctx.moveTo(bx0, by0);
+    for (let i = 1; i < pts.length; i++) {
+      const [bx, by] = worldToBEV(pts[i].X, pts[i].Z);
+      ctx.lineTo(bx, by);
+    }
+    ctx.stroke();
+  }
+
+  // ── Vehicles ──
+  for (const det of frame.detections) {
+    const u = (det.x1 + det.x2) / 2;  // horizontal centre
+    const v = det.y2;                  // bottom edge = ground contact
+    const world = imageToWorld(u, v, videoW, videoH, params);
+    if (!world) continue;
+    const [bx, by] = worldToBEV(world.X, world.Z);
+    if (bx < -10 || bx > W + 10 || by < -10 || by > H + 10) continue;
+    ctx.beginPath();
+    ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fillStyle = BOX_COLORS[det.track_id % BOX_COLORS.length];
+    ctx.fill();
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Subtitle component
 // ---------------------------------------------------------------------------
 
@@ -190,6 +309,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const bevCanvasRef = useRef<HTMLCanvasElement>(null);
   const isScrubbing = useRef(false);
   // Cache batch data: batchIndex → FrameEntry[]
   const batchCache = useRef<Record<number, FrameEntry[]>>({});
@@ -243,6 +363,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
   // ── Canvas drawing ──────────────────────────────────────────────────────
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
+    const bevCanvas = bevCanvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
     // Sync canvas resolution to its CSS size
@@ -251,14 +372,24 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
       canvas.height = canvas.clientHeight;
     }
     drawOverlay(canvas, video, frameDataRef.current, cameraParams);
+    // BEV
+    if (bevCanvas) {
+      if (bevCanvas.width !== bevCanvas.clientWidth || bevCanvas.height !== bevCanvas.clientHeight) {
+        bevCanvas.width = bevCanvas.clientWidth;
+        bevCanvas.height = bevCanvas.clientHeight;
+      }
+      drawBEV(bevCanvas, frameDataRef.current, cameraParams, video.videoWidth, video.videoHeight);
+    }
   }, [cameraParams]);
 
-  // Redraw when canvas is resized
+  // Redraw when either canvas is resized
   useEffect(() => {
     const canvas = canvasRef.current;
+    const bevCanvas = bevCanvasRef.current;
     if (!canvas) return;
     const ro = new ResizeObserver(redraw);
     ro.observe(canvas);
+    if (bevCanvas) ro.observe(bevCanvas);
     return () => ro.disconnect();
   }, [redraw]);
 
@@ -443,44 +574,54 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         {activeVideo ? (
           <>
-            {/* Video + canvas overlay */}
-            <div style={{ flex: 1, background: "#1a1a1a", overflow: "hidden", position: "relative" }}>
-              <video
-                key={activeVideo}
-                ref={videoRef}
-                src={`/api/footage/video?filename=${encodeURIComponent(activeVideo)}`}
-                style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onTimeUpdate={() => {
-                  const vid = videoRef.current;
-                  if (!vid) return;
-                  if (!isScrubbing.current) setCurrentTime(vid.currentTime);
-                  loadFrameAndDraw(vid.currentTime);
-                }}
-                onSeeked={() => {
-                  const vid = videoRef.current;
-                  if (vid) loadFrameAndDraw(vid.currentTime);
-                }}
-                onLoadedMetadata={() => {
-                  const vid = videoRef.current;
-                  if (vid) {
-                    setDuration(vid.duration);
-                    setCurrentTime(0);
-                    setIsPlaying(false);
-                    loadFrameAndDraw(0);
-                  }
-                }}
-              />
-              <canvas
-                ref={canvasRef}
-                style={{
-                  position: "absolute",
-                  top: 0, left: 0,
-                  width: "100%", height: "100%",
-                  pointerEvents: "none",
-                }}
-              />
+            {/* Video + canvas overlay + BEV */}
+            <div style={{ flex: 1, background: "#1a1a1a", overflow: "hidden", display: "flex" }}>
+              {/* Video + detection overlay */}
+              <div style={{ flex: 1, position: "relative", minWidth: 0 }}>
+                <video
+                  key={activeVideo}
+                  ref={videoRef}
+                  src={`/api/footage/video?filename=${encodeURIComponent(activeVideo)}`}
+                  style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onTimeUpdate={() => {
+                    const vid = videoRef.current;
+                    if (!vid) return;
+                    if (!isScrubbing.current) setCurrentTime(vid.currentTime);
+                    loadFrameAndDraw(vid.currentTime);
+                  }}
+                  onSeeked={() => {
+                    const vid = videoRef.current;
+                    if (vid) loadFrameAndDraw(vid.currentTime);
+                  }}
+                  onLoadedMetadata={() => {
+                    const vid = videoRef.current;
+                    if (vid) {
+                      setDuration(vid.duration);
+                      setCurrentTime(0);
+                      setIsPlaying(false);
+                      loadFrameAndDraw(0);
+                    }
+                  }}
+                />
+                <canvas
+                  ref={canvasRef}
+                  style={{
+                    position: "absolute",
+                    top: 0, left: 0,
+                    width: "100%", height: "100%",
+                    pointerEvents: "none",
+                  }}
+                />
+              </div>
+              {/* Bird's Eye View */}
+              <div style={{ width: "220px", flexShrink: 0, borderLeft: "1px solid #333" }}>
+                <canvas
+                  ref={bevCanvasRef}
+                  style={{ width: "100%", height: "100%", display: "block" }}
+                />
+              </div>
             </div>
 
             {/* Controls */}
