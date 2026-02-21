@@ -440,15 +440,8 @@ async def save_annotation(req: AnnotationRequest):
     return {"ok": True}
 
 
-class SolveRequest(BaseModel):
-    directory: str
-
-
-@router.post("/solve")
-async def solve(req: SolveRequest):
-    """Read all annotated images in directory and solve for FOV + pitch + height."""
-    directory = Path(req.directory)
-
+def _collect_measurements(directory: Path) -> list[dict]:
+    """Read all sidecar files in directory and return fully-annotated measurements."""
     measurements = []
     for f in sorted(directory.iterdir()):
         if f.suffix.lower() not in IMAGE_EXTENSIONS:
@@ -483,6 +476,17 @@ async def solve(req: SolveRequest):
                 "image_height": sidecar.get("image_height", 1080),
             }
         )
+    return measurements
+
+
+class SolveRequest(BaseModel):
+    directory: str
+
+
+@router.post("/solve")
+async def solve(req: SolveRequest):
+    """Read all annotated images in directory and solve for FOV + pitch + height."""
+    measurements = _collect_measurements(Path(req.directory))
 
     if len(measurements) < 2:
         raise HTTPException(
@@ -490,9 +494,29 @@ async def solve(req: SolveRequest):
             f"Need at least 2 complete measurements, got {len(measurements)}",
         )
 
-    # Use dimensions from first measurement (assume same camera for all)
     image_width = measurements[0]["image_width"]
     image_height = measurements[0]["image_height"]
+    return solve_camera_params(measurements, image_width, image_height)
 
+
+@router.get("/params")
+async def get_camera_params():
+    """Return solved camera parameters using the data directory's calibration images.
+
+    Returns 404 if fewer than 2 images are fully annotated.
+    Includes image_width and image_height so callers can scale fx to other resolutions.
+    """
+    measurements = _collect_measurements(DATA_DIR)
+
+    if len(measurements) < 2:
+        raise HTTPException(
+            404,
+            f"Need at least 2 calibrated images, have {len(measurements)}",
+        )
+
+    image_width = measurements[0]["image_width"]
+    image_height = measurements[0]["image_height"]
     result = solve_camera_params(measurements, image_width, image_height)
+    result["image_width"] = image_width
+    result["image_height"] = image_height
     return result

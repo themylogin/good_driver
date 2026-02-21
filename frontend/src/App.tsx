@@ -3,6 +3,14 @@ import Calibrate from "./components/Calibrate";
 import UploadFootage from "./components/UploadFootage";
 import Analytics from "./components/Analytics";
 
+export interface CameraParams {
+  fx: number;
+  pitch_degrees: number;
+  camera_height_m: number;
+  image_width: number;
+  image_height: number;
+}
+
 type Tab = "calibrate" | "upload" | "analytics";
 
 const TABS: { id: Tab; label: string }[] = [
@@ -16,6 +24,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("calibrate");
   const [isOpening, setIsOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
+  const [cameraParams, setCameraParams] = useState<CameraParams | null>(null);
+  const [tabError, setTabError] = useState<string | null>(null);
 
   const handleOpen = async () => {
     setIsOpening(true);
@@ -30,6 +40,20 @@ export default function App() {
     } finally {
       setIsOpening(false);
     }
+  };
+
+  const handleTabClick = async (tabId: Tab) => {
+    setTabError(null);
+    if (tabId === "upload") {
+      // Always re-fetch params so they update after the user recalibrates
+      const res = await fetch("/api/calibrate/params");
+      if (!res.ok) {
+        setTabError("Complete camera calibration first (need ≥ 2 fully annotated images).");
+        return;
+      }
+      setCameraParams(await res.json());
+    }
+    setActiveTab(tabId);
   };
 
   // No directory open yet — show picker
@@ -75,7 +99,7 @@ export default function App() {
         {TABS.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => handleTabClick(tab.id)}
             style={{
               padding: "0.75rem 1.5rem",
               border: "none",
@@ -97,9 +121,34 @@ export default function App() {
         </div>
       </div>
 
+      {/* Tab error banner */}
+      {tabError && (
+        <div
+          style={{
+            padding: "0.4rem 1rem",
+            background: "#fff8e1",
+            borderBottom: "1px solid #ffe082",
+            color: "#795548",
+            fontSize: "0.85rem",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexShrink: 0,
+          }}
+        >
+          {tabError}
+          <button
+            onClick={() => setTabError(null)}
+            style={{ border: "none", background: "none", cursor: "pointer", color: "#795548", fontWeight: 700 }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       <div style={{ flex: 1, overflow: "hidden" }}>
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
-        {activeTab === "upload" && <UploadFootage />}
+        {activeTab === "upload" && cameraParams && <UploadFootage cameraParams={cameraParams} />}
         {activeTab === "analytics" && <Analytics />}
       </div>
     </div>
