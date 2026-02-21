@@ -24,15 +24,6 @@ DATA_DIR = PROJECT_ROOT / "data"
 MODEL_PATH = PROJECT_ROOT / "backend" / "models" / "yolopv2_384x640.onnx"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-# Vehicle classes to detect: (COCO class id 0-indexed, display label)
-COCO_VEHICLE_CLASSES: list[tuple[int, str]] = [
-    (2, "Car"),
-    (3, "Motorcycle"),
-    (5, "Bus"),
-    (7, "Truck"),
-]
-_VEHICLE_CLASS_IDS = {c for c, _ in COCO_VEHICLE_CLASSES}
-_VEHICLE_CLASS_MAP = {c: n for c, n in COCO_VEHICLE_CLASSES}
 
 # Lazy-loaded ONNX session
 _session = None
@@ -124,15 +115,13 @@ def _decode_raw_predictions(outputs: list) -> list[dict]:
 
             obj_conf = _sigmoid(p[..., 4])
 
+            # This model is a single-class vehicle detector fine-tuned from COCO weights.
+            # Only one class slot is active; use max class confidence for fg/bg discrimination
+            # but label everything as "Car".
             if nc > 5:
                 cls_conf = _sigmoid(p[..., 5:])
-                valid = [(c, n) for c, n in COCO_VEHICLE_CLASSES if c < cls_conf.shape[-1]]
-                vehicle_scores = np.stack([cls_conf[..., c] for c, _ in valid], axis=-1)
-                best_idx = vehicle_scores.argmax(axis=-1)
-                car_score = obj_conf * vehicle_scores.max(axis=-1)
+                car_score = obj_conf * cls_conf.max(axis=-1)
             else:
-                valid = COCO_VEHICLE_CLASSES
-                best_idx = np.zeros(obj_conf.shape, dtype=int)
                 car_score = obj_conf
 
             mask = car_score > _CONF_THRESHOLD
@@ -142,7 +131,6 @@ def _decode_raw_predictions(outputs: list) -> list[dict]:
             for gy, gx in zip(*np.where(mask)):
                 cx, cy_ = float(bx[gy, gx]), float(by[gy, gx])
                 w, h = float(bw[gy, gx]), float(bh[gy, gx])
-                label = valid[int(best_idx[gy, gx])][1]
                 boxes.append(
                     {
                         "x1": cx - w / 2,
@@ -150,7 +138,6 @@ def _decode_raw_predictions(outputs: list) -> list[dict]:
                         "x2": cx + w / 2,
                         "y2": cy_ + h / 2,
                         "confidence": float(car_score[gy, gx]),
-                        "label": label,
                     }
                 )
     return boxes
@@ -163,8 +150,8 @@ def _decode_postnms_detections(det: np.ndarray) -> list[dict]:
     """
     boxes = []
     for row in det[0]:
-        x1, y1, x2, y2, score, cls = row
-        if int(cls) in _VEHICLE_CLASS_IDS and score > _CONF_THRESHOLD:
+        x1, y1, x2, y2, score, _cls = row
+        if score > _CONF_THRESHOLD:
             boxes.append(
                 {
                     "x1": float(x1),
@@ -172,7 +159,6 @@ def _decode_postnms_detections(det: np.ndarray) -> list[dict]:
                     "x2": float(x2),
                     "y2": float(y2),
                     "confidence": float(score),
-                    "label": _VEHICLE_CLASS_MAP.get(int(cls), "Vehicle"),
                 }
             )
     return boxes
@@ -260,7 +246,6 @@ def detect_cars(image_path: Path) -> tuple[list[dict], int, int]:
             "x2": x2,
             "y2": y2,
             "confidence": round(b["confidence"], 3),
-            "label": b.get("label", "Car"),
         })
     return detections, orig_w, orig_h
 

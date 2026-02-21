@@ -11,7 +11,6 @@ interface Detection {
   x2: number;
   y2: number;
   confidence: number;
-  label: string;
 }
 
 interface CalibratedImage {
@@ -239,17 +238,6 @@ function drawDetections(
     ctx.lineWidth = lw;
     ctx.strokeRect(x, y, w, h);
 
-    const text = `${det.label} (${Math.round(det.confidence * 100)}%)`;
-    const color = selected ? "#ff6600" : "#00cc44";
-    ctx.font = "bold 12px system-ui";
-    const textW = ctx.measureText(text).width;
-    const pad = 3;
-    const bgH = 14;
-    const bgLeft = x - lw / 2;
-    ctx.fillStyle = color;
-    ctx.fillRect(bgLeft, y - bgH, textW + pad * 2, bgH);
-    ctx.fillStyle = "#fff";
-    ctx.fillText(text, bgLeft + pad, y - 3);
   }
 }
 
