@@ -176,6 +176,27 @@ function drawOverlay(
 }
 
 // ---------------------------------------------------------------------------
+// Lane fitting helpers
+// ---------------------------------------------------------------------------
+
+const LANE_WIDTH_FALLBACK = 3.5; // metres (standard lane width)
+
+/** Least-squares linear fit: X = a·Z + b */
+function fitLinear(pts: { X: number; Z: number }[]): { a: number; b: number } | null {
+  const n = pts.length;
+  if (n < 2) return null;
+  let sumZ = 0, sumX = 0, sumZZ = 0, sumXZ = 0;
+  for (const { X, Z } of pts) {
+    sumZ += Z; sumX += X; sumZZ += Z * Z; sumXZ += X * Z;
+  }
+  const denom = n * sumZZ - sumZ * sumZ;
+  if (Math.abs(denom) < 1e-9) return null;
+  const a = (n * sumXZ - sumX * sumZ) / denom;
+  const b = (sumX - a * sumZ) / n;
+  return { a, b };
+}
+
+// ---------------------------------------------------------------------------
 // Bird's Eye View drawing
 // ---------------------------------------------------------------------------
 
@@ -270,6 +291,150 @@ function drawBEV(
 }
 
 // ---------------------------------------------------------------------------
+// Lanes BEV (fitted + extended lane dividers, cars snapped to lane centre)
+// ---------------------------------------------------------------------------
+
+function drawLanesBEV(
+  bevCanvas: HTMLCanvasElement,
+  frame: FrameEntry | null,
+  params: CameraParams,
+  videoW: number,
+  videoH: number,
+) {
+  const ctx = bevCanvas.getContext("2d")!;
+  const W = bevCanvas.width;
+  const H = bevCanvas.height;
+  if (!W || !H) return;
+
+  const scaleZ = H / BEV_MAX_DIST;
+  const scaleX = (W / 2) / BEV_HALF_WIDTH;
+  const ppm = Math.min(scaleZ, scaleX);
+  const cxBEV = W / 2;
+
+  function worldToBEV(X: number, Z: number): [number, number] {
+    return [cxBEV + X * ppm, H - Z * ppm];
+  }
+
+  // Background + grid (identical to raw BEV)
+  ctx.fillStyle = "#464646";
+  ctx.fillRect(0, 0, W, H);
+  ctx.lineWidth = 1;
+  ctx.font = "11px system-ui";
+  ctx.textAlign = "left";
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.beginPath();
+  ctx.moveTo(cxBEV, H);
+  ctx.lineTo(cxBEV, 0);
+  ctx.stroke();
+  for (let z = 5; z <= BEV_MAX_DIST; z += 5) {
+    const [, gy] = worldToBEV(0, z);
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(W, gy);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillText(`${z}m`, cxBEV + 4, gy - 3);
+  }
+
+  if (!frame || !videoW || !videoH) return;
+
+  // ── Project each raw lane line to world space ──
+  const linePts: { X: number; Z: number }[][] = [];
+  for (const line of frame.lane_lines) {
+    const pts = line
+      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
+      .filter(Boolean) as { X: number; Z: number }[];
+    if (pts.length >= 2) linePts.push(pts);
+  }
+
+  // ── Fit each line independently, then derive a shared median slope ──
+  // Real lane lines are parallel in world space, so forcing a common slope
+  // prevents independently-fitted lines from crossing during extrapolation.
+  const indivFits = linePts.map(fitLinear).filter(Boolean) as { a: number; b: number }[];
+  const sortedSlopes = indivFits.map(f => f.a).sort((p, q) => p - q);
+  const sharedA = sortedSlopes.length > 0
+    ? sortedSlopes[Math.floor(sortedSlopes.length / 2)]
+    : 0;
+
+  // Re-solve b with the shared slope: b = mean(X - sharedA·Z)
+  const fitted = linePts.map(pts => {
+    const b = pts.reduce((s, { X, Z }) => s + X - sharedA * Z, 0) / pts.length;
+    return { a: sharedA, b };
+  });
+
+  // Sort left-to-right by X at a near reference depth
+  const REF_Z = 10;
+  fitted.sort((p, q) => (p.a * REF_Z + p.b) - (q.a * REF_Z + q.b));
+
+  // ── Deduplicate: drop any line within MIN_LANE_GAP metres of the previous ──
+  const MIN_LANE_GAP = 1.0; // metres
+  const deduped = fitted.filter((line, i) => {
+    if (i === 0) return true;
+    const prevX = fitted[i - 1].a * REF_Z + fitted[i - 1].b;
+    const thisX = line.a * REF_Z + line.b;
+    return thisX - prevX >= MIN_LANE_GAP;
+  });
+
+  // ── Draw full-height lane dividers ──
+  ctx.strokeStyle = "#FFD700";
+  ctx.lineWidth = 2;
+  for (const { a, b } of deduped) {
+    const [bx0, by0] = worldToBEV(b, 0);
+    const [bx1, by1] = worldToBEV(a * BEV_MAX_DIST + b, BEV_MAX_DIST);
+    ctx.beginPath();
+    ctx.moveTo(bx0, by0);
+    ctx.lineTo(bx1, by1);
+    ctx.stroke();
+  }
+
+  // ── Draw vehicles snapped to lane centre ──
+  for (const det of frame.detections) {
+    const u = (det.x1 + det.x2) / 2;
+    const v = det.y2;
+    const world = imageToWorld(u, v, videoW, videoH, params);
+    if (!world) continue;
+    const { X: carX, Z: carZ } = world;
+
+    // Evaluate deduped lines at carZ, sorted left-to-right
+    const lineXs = deduped.map(({ a, b }) => a * carZ + b).sort((p, q) => p - q);
+
+    let midX: number;
+    if (lineXs.length === 0) {
+      midX = carX;
+    } else if (lineXs.length === 1) {
+      midX = carX < lineXs[0]
+        ? lineXs[0] - LANE_WIDTH_FALLBACK / 2
+        : lineXs[0] + LANE_WIDTH_FALLBACK / 2;
+    } else {
+      let leftX: number | null = null;
+      let rightX: number | null = null;
+      for (const lx of lineXs) {
+        if (lx <= carX) leftX = lx;
+        else if (rightX === null) rightX = lx;
+      }
+      if (leftX === null) {
+        midX = lineXs[0] - LANE_WIDTH_FALLBACK / 2;
+      } else if (rightX === null) {
+        midX = lineXs[lineXs.length - 1] + LANE_WIDTH_FALLBACK / 2;
+      } else {
+        midX = (leftX + rightX) / 2;
+      }
+    }
+
+    const [bx, by] = worldToBEV(midX, carZ);
+    if (bx < -10 || bx > W + 10 || by < -10 || by > H + 10) continue;
+    ctx.beginPath();
+    ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fillStyle = BOX_COLORS[det.track_id % BOX_COLORS.length];
+    ctx.fill();
+    ctx.strokeStyle = "#000";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Subtitle component
 // ---------------------------------------------------------------------------
 
@@ -310,6 +475,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const bevCanvasRef = useRef<HTMLCanvasElement>(null);
+  const lanesBevCanvasRef = useRef<HTMLCanvasElement>(null);
   const isScrubbing = useRef(false);
   // Cache batch data: batchIndex → FrameEntry[]
   const batchCache = useRef<Record<number, FrameEntry[]>>({});
@@ -364,6 +530,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
     const bevCanvas = bevCanvasRef.current;
+    const lanesBevCanvas = lanesBevCanvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
     // Sync canvas resolution to its CSS size
@@ -372,7 +539,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
       canvas.height = canvas.clientHeight;
     }
     drawOverlay(canvas, video, frameDataRef.current, cameraParams);
-    // BEV
+    // Raw BEV
     if (bevCanvas) {
       if (bevCanvas.width !== bevCanvas.clientWidth || bevCanvas.height !== bevCanvas.clientHeight) {
         bevCanvas.width = bevCanvas.clientWidth;
@@ -380,16 +547,26 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
       }
       drawBEV(bevCanvas, frameDataRef.current, cameraParams, video.videoWidth, video.videoHeight);
     }
+    // Lanes BEV
+    if (lanesBevCanvas) {
+      if (lanesBevCanvas.width !== lanesBevCanvas.clientWidth || lanesBevCanvas.height !== lanesBevCanvas.clientHeight) {
+        lanesBevCanvas.width = lanesBevCanvas.clientWidth;
+        lanesBevCanvas.height = lanesBevCanvas.clientHeight;
+      }
+      drawLanesBEV(lanesBevCanvas, frameDataRef.current, cameraParams, video.videoWidth, video.videoHeight);
+    }
   }, [cameraParams]);
 
-  // Redraw when either canvas is resized
+  // Redraw when any canvas is resized
   useEffect(() => {
     const canvas = canvasRef.current;
     const bevCanvas = bevCanvasRef.current;
+    const lanesBevCanvas = lanesBevCanvasRef.current;
     if (!canvas) return;
     const ro = new ResizeObserver(redraw);
     ro.observe(canvas);
     if (bevCanvas) ro.observe(bevCanvas);
+    if (lanesBevCanvas) ro.observe(lanesBevCanvas);
     return () => ro.disconnect();
   }, [redraw]);
 
@@ -615,10 +792,17 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
                   }}
                 />
               </div>
-              {/* Bird's Eye View */}
+              {/* Bird's Eye View (raw) */}
               <div style={{ width: "220px", flexShrink: 0, borderLeft: "1px solid #333" }}>
                 <canvas
                   ref={bevCanvasRef}
+                  style={{ width: "100%", height: "100%", display: "block" }}
+                />
+              </div>
+              {/* Bird's Eye View (fitted lanes) */}
+              <div style={{ width: "220px", flexShrink: 0, borderLeft: "1px solid #333" }}>
+                <canvas
+                  ref={lanesBevCanvasRef}
                   style={{ width: "100%", height: "100%", display: "block" }}
                 />
               </div>
