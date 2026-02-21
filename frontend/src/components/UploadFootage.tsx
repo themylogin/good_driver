@@ -6,7 +6,7 @@ import type { CameraParams } from "../App";
 // ---------------------------------------------------------------------------
 
 interface Detection {
-  id: number;
+  track_id: number;
   x1: number; y1: number; x2: number; y2: number;
   confidence: number;
 }
@@ -122,7 +122,7 @@ function drawOverlay(
 
   // ── Bounding boxes + labels ──
   for (const det of frame.detections) {
-    const color = BOX_COLORS[det.id % BOX_COLORS.length];
+    const color = BOX_COLORS[det.track_id % BOX_COLORS.length];
     const cx1 = det.x1 * scale + offsetX;
     const cy1 = det.y1 * scale + offsetY;
     const bw  = (det.x2 - det.x1) * scale;

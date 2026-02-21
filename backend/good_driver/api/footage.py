@@ -23,6 +23,7 @@ from .calibrate import (
     _preprocess,
     _scale_boxes,
 )
+from ..tracker import ByteTracker
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +190,7 @@ def _infer_frame(
 
     scaled = _scale_boxes(boxes, sx, sy)
     detections = []
-    for i, b in enumerate(scaled):
+    for b in scaled:
         x1 = max(0, int(b["x1"]))
         y1 = max(0, int(b["y1"]))
         x2 = min(orig_w, int(b["x2"]))
@@ -199,7 +200,6 @@ def _infer_frame(
         if b["confidence"] < _CONF_THRESHOLD:
             continue
         detections.append({
-            "id": i,
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "confidence": round(b["confidence"], 3),
         })
@@ -240,6 +240,7 @@ def _process_video_worker(filename: str) -> None:
                         width=orig_w, height=orig_h)
 
         session = _get_session()
+        tracker = ByteTracker()
 
         batch: list[dict] = []
         frame_n = 0
@@ -250,6 +251,7 @@ def _process_video_worker(filename: str) -> None:
                 break
 
             result = _infer_frame(frame, orig_w, orig_h, session)
+            result["detections"] = tracker.update(result["detections"])
             result["frame"] = frame_n
             batch.append(result)
 
