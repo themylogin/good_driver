@@ -117,10 +117,10 @@ def _decode_raw_predictions(outputs: list) -> list[dict]:
         for ai, (aw, ah) in enumerate(anchors):
             p = pred[ai]  # [grid_h, grid_w, 85]
 
-            bx = (_sigmoid(p[..., 0]) + grid_x) * stride
-            by = (_sigmoid(p[..., 1]) + grid_y) * stride
-            bw = np.exp(np.clip(p[..., 2], -10, 10)) * aw
-            bh = np.exp(np.clip(p[..., 3], -10, 10)) * ah
+            bx = (_sigmoid(p[..., 0]) * 2 - 0.5 + grid_x) * stride
+            by = (_sigmoid(p[..., 1]) * 2 - 0.5 + grid_y) * stride
+            bw = np.power(_sigmoid(p[..., 2]) * 2, 2) * aw
+            bh = np.power(_sigmoid(p[..., 3]) * 2, 2) * ah
 
             obj_conf = _sigmoid(p[..., 4])
 
