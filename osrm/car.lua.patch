@@ -1,0 +1,22 @@
+--- osrm-backend/profiles/car.lua	2026-02-23 20:42:28.030277729 +0100
++++ good_driver/osrm/car.lua	2026-02-23 20:57:30.368202951 +0100
+@@ -487,6 +465,19 @@
+   if profile.cardinal_directions then
+       Relations.process_way_refs(way, relations, result)
+   end
++
++  -- Store speed limit in ref so it is accessible via steps[].ref in the HTTP API.
++  -- Prefer the explicit OSM maxspeed tag; fall back to the highway-type default speed.
++  local maxspeed_str = way:get_value_by_key('maxspeed') or
++                       way:get_value_by_key('source:maxspeed') or
++                       way:get_value_by_key('maxspeed:type')
++  local maxspeed_kmh = maxspeed_str and WayHandlers.parse_maxspeed(maxspeed_str, profile) or 0
++  if maxspeed_kmh <= 0 then
++    maxspeed_kmh = result.forward_speed  -- highway-type default, already set by WayHandlers.speed
++  end
++  if maxspeed_kmh and maxspeed_kmh > 0 then
++    result.ref = tostring(math.floor(maxspeed_kmh))
++  end
+ end
+ 
+ function process_turn(profile, turn)

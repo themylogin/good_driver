@@ -853,17 +853,23 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
                 />
               </div>
               {/* Bird's Eye View (schematic lanes) */}
-              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #000" }}>
+              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #fff", display: "flex", flexDirection: "column" }}>
+                <div style={{ background: "#2a2a2a", color: "#fff", textAlign: "center", fontSize: "0.75rem", fontFamily: "system-ui", padding: "3px 0", flexShrink: 0, letterSpacing: "0.05em" }}>
+                  processed
+                </div>
                 <canvas
                   ref={lanesBevCanvasRef}
-                  style={{ width: "100%", height: "100%", display: "block" }}
+                  style={{ width: "100%", flex: 1, display: "block" }}
                 />
               </div>
               {/* Bird's Eye View (raw) */}
-              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #000" }}>
+              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #fff", display: "flex", flexDirection: "column" }}>
+                <div style={{ background: "#2a2a2a", color: "#fff", textAlign: "center", fontSize: "0.75rem", fontFamily: "system-ui", padding: "3px 0", flexShrink: 0, letterSpacing: "0.05em" }}>
+                  original
+                </div>
                 <canvas
                   ref={bevCanvasRef}
-                  style={{ width: "100%", height: "100%", display: "block" }}
+                  style={{ width: "100%", flex: 1, display: "block" }}
                 />
               </div>
             </div>

@@ -2,6 +2,7 @@ import { useState } from "react";
 import Calibrate from "./components/Calibrate";
 import UploadFootage from "./components/UploadFootage";
 import Analytics from "./components/Analytics";
+import Settings from "./components/Settings";
 
 export interface CameraParams {
   fx: number;
@@ -11,9 +12,10 @@ export interface CameraParams {
   image_height: number;
 }
 
-type Tab = "calibrate" | "upload" | "analytics";
+type Tab = "settings" | "calibrate" | "upload" | "analytics";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "settings", label: "Settings" },
   { id: "calibrate", label: "Calibrate" },
   { id: "upload", label: "Upload footage" },
   { id: "analytics", label: "Analytics" },
@@ -21,7 +23,7 @@ const TABS: { id: Tab; label: string }[] = [
 
 export default function App() {
   const [directory, setDirectory] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>("calibrate");
+  const [activeTab, setActiveTab] = useState<Tab>("settings");
   const [isOpening, setIsOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
   const [cameraParams, setCameraParams] = useState<CameraParams | null>(null);
@@ -147,6 +149,7 @@ export default function App() {
       )}
 
       <div style={{ flex: 1, overflow: "hidden" }}>
+        {activeTab === "settings" && <Settings directory={directory} />}
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
         {activeTab === "upload" && cameraParams && <UploadFootage cameraParams={cameraParams} />}
         {activeTab === "analytics" && <Analytics />}

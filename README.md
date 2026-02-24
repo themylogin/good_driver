@@ -6,6 +6,66 @@ Cross-platform desktop application with a web UI frontend.
 - **Frontend**: React / TypeScript / Vite
 - **Desktop**: pywebview + PyInstaller
 
+## User Instructions
+
+### Additional Services
+
+#### osrm-backend
+
+Required if you want to check for speed limit violations. OSRM provides map matching (snapping GPS tracks to the road network) and exposes speed limits from OSM data.
+
+**1. Download the OSM extract for your region:**
+
+```bash
+wget http://download.geofabrik.de/europe/spain-latest.osm.pbf
+```
+
+**2. Clone osrm-backend:**
+
+```bash
+git clone --depth 1 --branch v6.0.0 https://github.com/Project-OSRM/osrm-backend.git
+```
+
+**3. Patch the car profile with speed limit annotation support:**
+
+```bash
+patch osrm-backend/profiles/car.lua < ../good_driver/osrm/car.lua.patch
+```
+
+**4. Prepare routing data:**
+
+```bash
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend:v6.0.0 osrm-extract -p /data/osrm-backend/profiles/car.lua /data/spain-latest.osm.pbf
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend:v6.0.0 osrm-partition /data/spain-latest.osm.pbf
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend:v6.0.0 osrm-customize /data/spain-latest.osm.pbf
+```
+
+**5. Run the server:**
+
+```bash
+docker run -t -i -p 5000:5000 -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend:v6.0.0 osrm-routed --algorithm mld /data/spain-latest.osm.pbf
+```
+
+The server will be available at `http://localhost:5000`.
+
+#### Nominatim
+
+Required if you want the locations of unsafe driving incidents to be described as human-readable addresses.
+
+The following command imports the OSM data and starts the service. **Import takes several hours** for a country-sized extract.
+
+Run from the directory containing `spain-latest.osm.pbf`:
+
+```bash
+docker run -it \
+  -e PBF_PATH=/nominatim/data/spain-latest.osm.pbf \
+  -v "$(pwd):/nominatim/data" \
+  -p 8080:8080 \
+  mediagis/nominatim:5.2
+```
+
+The server will be available at `http://localhost:8080`.
+
 ## Prerequisites
 
 - Python 3.12+
