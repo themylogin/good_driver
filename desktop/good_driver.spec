@@ -24,6 +24,7 @@ a = Analysis(
         (str(ROOT / "desktop" / "MicrosoftEdgeWebview2Setup.exe"), "."),
     ],
     hiddenimports=[
+        "webview.platforms.winforms",
         "webview.platforms.edgechromium",
         "clr",
         "good_driver",

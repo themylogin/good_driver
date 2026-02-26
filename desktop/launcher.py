@@ -36,6 +36,8 @@ def _ensure_webview2():
 
     if bootstrapper.exists():
         subprocess.run([str(bootstrapper), "/silent", "/install"], check=False)
+        # WebView2 was just installed; restart so the process picks it up
+        os.execv(sys.executable, sys.argv)
 
 
 def find_free_port() -> int:
@@ -100,7 +102,11 @@ def main() -> None:
 
     import webview
 
-    webview.settings["WEBVIEW2_RUNTIME_PATH"] = "."
+    # pywebview's _is_chromium() registry check fails on some Windows machines even
+    # when WebView2 is installed. Setting WEBVIEW2_RUNTIME_PATH to a truthy value
+    # bypasses that check. The path doesn't exist, so edgechromium.py falls through
+    # to the system-installed WebView2 runtime.
+    webview.settings["WEBVIEW2_RUNTIME_PATH"] = "__force_edgechromium__"
 
     window = webview.create_window(
         "Good Driver",
