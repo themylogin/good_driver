@@ -77,13 +77,16 @@ def main() -> None:
 
     import webview
 
+    if sys.platform == "win32":
+        webview.settings["WEBVIEW2_RUNTIME_PATH"] = "."
+
     window = webview.create_window(
         "Good Driver",
         f"http://127.0.0.1:{port}",
         width=1200,
         height=800,
     )
-    webview.start(func=window.restore, debug=True, gui="edgechromium")
+    webview.start(func=window.restore, debug=True)
 
 
 if __name__ == "__main__":
