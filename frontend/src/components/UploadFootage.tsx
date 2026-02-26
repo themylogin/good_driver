@@ -17,7 +17,7 @@ interface FrameEntry {
   lane_lines: number[][][];  // [line][[x,y],...]
 }
 
-type VideoMeta = { total_frames: number; processed_frames: number; fps?: number } | null;
+type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
 
 /** A detected vehicle assigned to a lane. */
 interface CarInLane {
@@ -60,6 +60,8 @@ const btnStyle: React.CSSProperties = {
   cursor: "pointer",
   fontSize: "0.85rem",
   fontFamily: "system-ui",
+  height: "30px",
+  lineHeight: "1",
 };
 
 // ---------------------------------------------------------------------------
@@ -498,7 +500,22 @@ function drawLanesBEV(
 // Subtitle component
 // ---------------------------------------------------------------------------
 
-function VideoSubtitle({ meta }: { meta: VideoMeta }) {
+interface ProgressSnapshot {
+  frames: number;
+  time: number;
+}
+
+function formatEta(seconds: number): string {
+  const total = Math.ceil(seconds);
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta: VideoMeta; progressRef: React.RefObject<Record<string, ProgressSnapshot>> }) {
   if (!meta || meta.total_frames === 0) {
     return <div style={{ color: "#aaa", fontSize: "0.78rem" }}>Not processed</div>;
   }
@@ -506,9 +523,23 @@ function VideoSubtitle({ meta }: { meta: VideoMeta }) {
     return <div style={{ color: "#4a0", fontSize: "0.78rem" }}>Processing complete</div>;
   }
   const pct = Math.round((meta.processed_frames / meta.total_frames) * 100);
+
+  // Compute ETA from first observation of progress
+  let etaStr = "";
+  const snap = progressRef.current?.[filename];
+  if (snap && meta.processed_frames > snap.frames) {
+    const elapsed = (Date.now() - snap.time) / 1000;
+    const done = meta.processed_frames - snap.frames;
+    const remaining = meta.total_frames - meta.processed_frames;
+    const rate = done / elapsed;
+    if (rate > 0) {
+      etaStr = `ETA ${formatEta(remaining / rate)}`;
+    }
+  }
+
   return (
     <div style={{ color: "#888", fontSize: "0.78rem" }}>
-      Processed {meta.processed_frames}/{meta.total_frames} frames ({pct}%)
+      {meta.processed_frames}/{meta.total_frames} frames ({pct}%){etaStr && `, ${etaStr}`}
     </div>
   );
 }
@@ -546,6 +577,8 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   // Cache batch data: batchIndex → FrameEntry[]
   const batchCache = useRef<Record<number, FrameEntry[]>>({});
   const frameDataRef = useRef<FrameEntry | null>(null);
+  // ETA tracking: filename → first observed {frames, time} for current processing run
+  const progressSnapshots = useRef<Record<string, ProgressSnapshot>>({});
 
   // ── Fetch metadata for all videos ──────────────────────────────────────
   const fetchAllMeta = useCallback(async (videoList: VideoEntry[]) => {
@@ -556,7 +589,20 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
         return [v.filename, data] as [string, VideoMeta];
       }),
     );
-    setMetas(Object.fromEntries(entries));
+    const metaMap = Object.fromEntries(entries);
+    setMetas(metaMap);
+    // Detect active processing from backend and seed ETA snapshots
+    const now = Date.now();
+    let anyProcessing = false;
+    for (const [fname, m] of Object.entries(metaMap) as [string, VideoMeta][]) {
+      if (m?.processing) {
+        anyProcessing = true;
+        if (!progressSnapshots.current[fname]) {
+          progressSnapshots.current[fname] = { frames: m.processed_frames, time: now };
+        }
+      }
+    }
+    if (anyProcessing) setProcessingStarted(true);
   }, [directory]);
 
   // ── Load video list on mount ────────────────────────────────────────────
@@ -593,7 +639,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   }, [allComplete]);
   useEffect(() => {
     if (!processingStarted || videos.length === 0) return;
-    const id = setInterval(() => fetchAllMeta(videos), 2000);
+    const id = setInterval(() => fetchAllMeta(videos), 1000);
     return () => clearInterval(id);
   }, [processingStarted, videos, fetchAllMeta]);
 
@@ -723,6 +769,14 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   // ── "Start processing" ──────────────────────────────────────────────────
   const handleStartProcessing = async () => {
     setProcessingStarted(true);
+    // Record current progress as baseline for ETA calculation
+    const now = Date.now();
+    for (const v of videos) {
+      const m = metas[v.filename];
+      if (m && m.total_frames > 0 && m.processed_frames < m.total_frames) {
+        progressSnapshots.current[v.filename] = { frames: m.processed_frames, time: now };
+      }
+    }
     try {
       const res = await fetch(`/api/footage/start-processing?directory=${encodeURIComponent(directory)}`, { method: "POST" });
       const data = await res.json();
@@ -782,7 +836,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
               >
                 {v.filename}
               </div>
-              <VideoSubtitle meta={metas[v.filename] ?? null} />
+              <VideoSubtitle filename={v.filename} meta={metas[v.filename] ?? null} progressRef={progressSnapshots} />
             </div>
           ))}
         </div>

@@ -37,6 +37,7 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 _executor = ThreadPoolExecutor(max_workers=1)
 _processing_videos: set[str] = set()   # "directory|filename" keys currently queued or running
+_live_progress: dict[str, int] = {}    # key → current frame_n (updated every frame)
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +235,27 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
 
         ddir = _data_dir(data_dir, filename)
         ddir.mkdir(exist_ok=True)
-        _write_metadata(ddir, total, 0,
+
+        # Resume from last completed batch boundary
+        meta = _read_metadata(ddir)
+        resume_frame = 0
+        if meta is not None:
+            # Round down to nearest batch of 100 to resume cleanly
+            resume_frame = (meta["processed_frames"] // 100) * 100
+        _write_metadata(ddir, total, resume_frame,
                         fps=cap.get(cv2.CAP_PROP_FPS),
                         width=orig_w, height=orig_h)
+
+        # Seek to resume position
+        if resume_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
+            logger.info("Resuming %s from frame %d/%d", filename, resume_frame, total)
 
         session = _get_session()
         tracker = ByteTracker()
 
         batch: list[dict] = []
-        frame_n = 0
+        frame_n = resume_frame
 
         while True:
             ok, frame = cap.read()
@@ -262,6 +275,7 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
                 _write_metadata(ddir, total, frame_n + 1)
                 batch = []
 
+            _live_progress[key] = frame_n + 1
             frame_n += 1
 
         # Flush remainder (< 100 frames)
@@ -278,6 +292,7 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
     except Exception:
         logger.exception("Error processing video %s", filename)
     finally:
+        _live_progress.pop(key, None)
         _processing_videos.discard(key)
 
 
@@ -326,6 +341,12 @@ async def get_metadata(filename: str, directory: str):
     meta = _read_metadata(ddir)
     if meta is None:
         return {"total_frames": 0, "processed_frames": 0}
+    # Overlay live frame counter for more granular progress
+    key = f"{directory}|{filename}"
+    live = _live_progress.get(key)
+    if live is not None and live > meta.get("processed_frames", 0):
+        meta = {**meta, "processed_frames": live}
+    meta["processing"] = key in _processing_videos
     return meta
 
 
