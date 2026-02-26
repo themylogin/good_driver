@@ -25,20 +25,25 @@ def find_free_port() -> int:
 
 
 def start_server(port: int, log_stream) -> None:
-    import uvicorn
-    import logging
+    try:
+        import uvicorn
+        import logging
 
-    # Ensure the backend package is importable
-    backend_dir = Path(__file__).resolve().parent.parent / "backend"
-    if backend_dir.is_dir() and str(backend_dir) not in sys.path:
-        sys.path.insert(0, str(backend_dir))
+        # Ensure the backend package is importable
+        backend_dir = Path(__file__).resolve().parent.parent / "backend"
+        if backend_dir.is_dir() and str(backend_dir) not in sys.path:
+            sys.path.insert(0, str(backend_dir))
 
-    from good_driver.app import create_app
+        logging.basicConfig(stream=log_stream, level=logging.INFO)
 
-    logging.basicConfig(stream=log_stream, level=logging.INFO)
+        from good_driver.app import create_app
 
-    app = create_app()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+        app = create_app()
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    except Exception:
+        import traceback
+        traceback.print_exc(file=log_stream)
+        log_stream.flush()
 
 
 def wait_for_server(port: int, timeout: float = 10.0) -> None:
@@ -63,7 +68,12 @@ def main() -> None:
     server_thread = threading.Thread(target=start_server, args=(port, log_stream), daemon=True)
     server_thread.start()
 
-    wait_for_server(port)
+    try:
+        wait_for_server(port)
+    except TimeoutError as e:
+        log_stream.write(f"ERROR: {e}\n")
+        log_stream.flush()
+        sys.exit(1)
 
     import webview
 
@@ -73,7 +83,7 @@ def main() -> None:
         width=1200,
         height=800,
     )
-    webview.start()
+    webview.start(func=window.restore)
 
 
 if __name__ == "__main__":
