@@ -7,6 +7,10 @@ ROOT = Path(SPECPATH).parent
 BACKEND = ROOT / "backend"
 FRONTEND_DIST = BACKEND / "frontend_dist"
 
+# NOTE: The ONNX model (yolopv2_384x640.onnx) is intentionally NOT bundled here.
+# It must be downloaded separately after installation via:  download-model
+# The launcher will check for the model on startup and prompt the user to download it.
+
 a = Analysis(
     [str(ROOT / "desktop" / "launcher.py")],
     pathex=[str(BACKEND)],
@@ -17,9 +21,11 @@ a = Analysis(
         "good_driver",
         "good_driver.app",
         "good_driver.config",
+        "good_driver.model",
         "good_driver.static_files",
         "good_driver.api",
         "good_driver.api.health",
+        "good_driver.api.model",
         "uvicorn.logging",
         "uvicorn.loops",
         "uvicorn.loops.auto",
@@ -51,7 +57,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

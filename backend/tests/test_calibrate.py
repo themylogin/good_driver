@@ -43,7 +43,7 @@ async def test_detect_requires_model(app):
     """detect endpoint should work if model exists, or return 500 with helpful message."""
     model_path = PROJECT_ROOT / "backend" / "models" / "yolopv2_384x640.onnx"
     if not model_path.exists():
-        pytest.skip("Model not downloaded yet - run: uv run python download_model.py")
+        pytest.skip("Model not downloaded yet - run: uv run python -m good_driver.model")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(

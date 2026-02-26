@@ -25,4 +25,4 @@ test:
 	cd backend && uv run pytest
 
 download-model:
-	cd backend && uv run python download_model.py
+	cd backend && uv run python -m good_driver.model

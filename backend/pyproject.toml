@@ -8,7 +8,8 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "pywebview>=5",
     "numpy>=2.4.2",
-    "onnxruntime>=1.24.2",
+    "onnxruntime-gpu>=1.24.2; (sys_platform == 'linux' or sys_platform == 'win32') and platform_machine == 'x86_64'",
+    "onnxruntime>=1.24.2; sys_platform == 'darwin' or platform_machine != 'x86_64'",
     "scipy>=1.17.0",
     "pillow>=12.1.1",
     "python-multipart>=0.0.22",
@@ -23,6 +24,9 @@ dev = [
     "pytest-asyncio>=0.25",
     "websocket-client>=1.9.0",
 ]
+
+[project.scripts]
+download-model = "good_driver.model:download_cli"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

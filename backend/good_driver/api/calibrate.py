@@ -14,6 +14,8 @@ from PIL import Image
 from pydantic import BaseModel
 from scipy.optimize import least_squares
 
+from good_driver.model import get_model_path
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/calibrate")
@@ -21,12 +23,48 @@ router = APIRouter(prefix="/calibrate")
 # Project root: backend/good_driver/api/calibrate.py → ../../../../
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / "data"
-MODEL_PATH = PROJECT_ROOT / "backend" / "models" / "yolopv2_384x640.onnx"
+MODEL_PATH = get_model_path()
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # Lazy-loaded ONNX session
 _session = None
+
+# GPU providers tried in priority order; CPUExecutionProvider is always appended as fallback.
+_PREFERRED_PROVIDERS = [
+    "TensorrtExecutionProvider",
+    "CUDAExecutionProvider",
+    "ROCMExecutionProvider",
+    "DmlExecutionProvider",
+    "OpenVINOExecutionProvider",
+    "CoreMLExecutionProvider",
+]
+
+
+def _build_providers() -> list[str]:
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    providers = [p for p in _PREFERRED_PROVIDERS if p in available]
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
+def get_hardware_info() -> dict:
+    # Eagerly initialize the session if the model is available so we report
+    # the provider that ONNX Runtime actually selected after trying each one.
+    if _session is None and MODEL_PATH.exists():
+        try:
+            _get_session()
+        except Exception:
+            pass
+
+    configured = _build_providers()
+    active = _session.get_providers()[0] if _session is not None else None
+    return {
+        "configured_providers": configured,
+        "active_provider": active,
+    }
 
 
 def _get_session():
@@ -36,10 +74,12 @@ def _get_session():
 
         if not MODEL_PATH.exists():
             raise RuntimeError(
-                f"Model not found at {MODEL_PATH}. Run: uv run python download_model.py"
+                f"Model not found at {MODEL_PATH}. Run: uv run python -m good_driver.model"
             )
-        _session = ort.InferenceSession(str(MODEL_PATH))
-        logger.info("Loaded YOLO model. Outputs:")
+        providers = _build_providers()
+        _session = ort.InferenceSession(str(MODEL_PATH), providers=providers)
+        logger.info("Loaded YOLO model with providers: %s", _session.get_providers())
+        logger.info("Outputs:")
         for o in _session.get_outputs():
             logger.info("  %s: %s", o.name, o.shape)
     return _session

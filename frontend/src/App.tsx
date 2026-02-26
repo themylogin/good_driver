@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Calibrate from "./components/Calibrate";
 import UploadFootage from "./components/UploadFootage";
 import Analytics from "./components/Analytics";
@@ -21,13 +21,210 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "analytics", label: "Analytics" },
 ];
 
+type StartupState = "checking" | "model-missing" | "ready";
+
+interface DownloadProgress {
+  downloaded: number;
+  total: number;
+}
+
+function formatBytes(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1 ? `${mb.toFixed(0)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+}
+
 export default function App() {
+  const [startupState, setStartupState] = useState<StartupState>("checking");
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+  const [downloadStatus, setDownloadStatus] = useState<"downloading" | "extracting" | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [modelName, setModelName] = useState("model");
+
   const [directory, setDirectory] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("settings");
   const [isOpening, setIsOpening] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
   const [cameraParams, setCameraParams] = useState<CameraParams | null>(null);
   const [tabError, setTabError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const healthRes = await fetch("/api/health");
+        const health = await healthRes.json();
+        if (health.mode !== "desktop") {
+          setStartupState("ready");
+          return;
+        }
+        const statusRes = await fetch("/api/model/status");
+        const status = await statusRes.json();
+        if (status.name) setModelName(status.name);
+        setStartupState(status.exists ? "ready" : "model-missing");
+      } catch {
+        // Health check failed (e.g. dev mode without backend); proceed normally.
+        setStartupState("ready");
+      }
+    })();
+  }, []);
+
+  const handleDownload = async () => {
+    setIsDownloading(true);
+    setDownloadError(null);
+    setDownloadProgress(null);
+    setDownloadStatus("downloading");
+
+    try {
+      const response = await fetch("/api/model/download", { method: "POST" });
+      if (!response.ok || !response.body) {
+        throw new Error(`Request failed: ${response.statusText}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.error) {
+              throw new Error(data.error);
+            } else if (data.status === "extracting") {
+              setDownloadStatus("extracting");
+            } else if (data.status === "done") {
+              setStartupState("ready");
+              return;
+            } else if (data.downloaded !== undefined) {
+              setDownloadProgress({ downloaded: data.downloaded, total: data.total });
+            }
+          } catch (parseErr) {
+            if (parseErr instanceof SyntaxError) continue;
+            throw parseErr;
+          }
+        }
+      }
+    } catch (e) {
+      setDownloadError(String(e));
+    } finally {
+      setIsDownloading(false);
+      setDownloadStatus(null);
+    }
+  };
+
+  // Startup check in progress
+  if (startupState === "checking") {
+    return (
+      <div
+        style={{
+          fontFamily: "system-ui",
+          height: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "#888",
+        }}
+      >
+        Loading...
+      </div>
+    );
+  }
+
+  // Model file missing — show download screen
+  if (startupState === "model-missing") {
+    const pct =
+      downloadProgress && downloadProgress.total > 0
+        ? Math.round((downloadProgress.downloaded / downloadProgress.total) * 100)
+        : null;
+
+    return (
+      <div
+        style={{
+          fontFamily: "system-ui",
+          height: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "1rem",
+          padding: "2rem",
+        }}
+      >
+        <div style={{ fontSize: "1rem", color: "#333" }}>
+          Model file <strong>{modelName}</strong> not found.
+        </div>
+
+        {!isDownloading && (
+          <button
+            onClick={handleDownload}
+            style={{
+              padding: "0.75rem 2rem",
+              fontSize: "1rem",
+              background: "#0066cc",
+              color: "#fff",
+              border: "none",
+              borderRadius: "6px",
+              cursor: "pointer",
+            }}
+          >
+            Download model
+          </button>
+        )}
+
+        {isDownloading && (
+          <div style={{ width: "320px", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+            <div style={{ fontSize: "0.9rem", color: "#555" }}>
+              {downloadStatus === "extracting"
+                ? "Extracting..."
+                : pct !== null
+                  ? `Downloading... ${pct}%`
+                  : "Connecting..."}
+            </div>
+            <div
+              style={{
+                height: "8px",
+                background: "#e0e0e0",
+                borderRadius: "4px",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: downloadStatus === "extracting" ? "100%" : pct !== null ? `${pct}%` : "0%",
+                  background: "#0066cc",
+                  borderRadius: "4px",
+                  transition: "width 0.2s",
+                }}
+              />
+            </div>
+            {downloadProgress && downloadStatus !== "extracting" && (
+              <div style={{ fontSize: "0.8rem", color: "#888", textAlign: "right" }}>
+                {formatBytes(downloadProgress.downloaded)}
+                {downloadProgress.total > 0 && ` / ${formatBytes(downloadProgress.total)}`}
+              </div>
+            )}
+          </div>
+        )}
+
+        {downloadError && (
+          <div style={{ color: "#cc0000", fontSize: "0.9rem", maxWidth: "360px", textAlign: "center" }}>
+            {downloadError}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Normal app flow below
 
   const handleOpen = async () => {
     setIsOpening(true);

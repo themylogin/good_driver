@@ -5,6 +5,21 @@ interface AppSettings {
   nominatim_url: string;
 }
 
+interface HardwareInfo {
+  configured_providers: string[];
+  active_provider: string | null;
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  TensorrtExecutionProvider: "NVIDIA TensorRT (GPU)",
+  CUDAExecutionProvider: "NVIDIA CUDA (GPU)",
+  ROCMExecutionProvider: "AMD ROCm (GPU)",
+  DmlExecutionProvider: "DirectML (GPU)",
+  OpenVINOExecutionProvider: "Intel OpenVINO",
+  CoreMLExecutionProvider: "Apple Core ML (GPU / Neural Engine)",
+  CPUExecutionProvider: "CPU",
+};
+
 type CheckStatus = "idle" | "checking" | "ok" | "error";
 
 interface CheckState {
@@ -58,6 +73,14 @@ export default function Settings({ directory }: { directory: string }) {
   });
   const [osrmCheck, setOsrmCheck] = useState<CheckState>({ status: "idle" });
   const [nominatimCheck, setNominatimCheck] = useState<CheckState>({ status: "idle" });
+  const [hardware, setHardware] = useState<HardwareInfo | null>(null);
+
+  useEffect(() => {
+    fetch("/api/hardware")
+      .then((r) => r.json())
+      .then(setHardware)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch(`/api/settings?directory=${encodeURIComponent(directory)}`)
@@ -188,6 +211,37 @@ export default function Settings({ directory }: { directory: string }) {
             {renderCheckResult(nominatimCheck)}
           </div>
         </div>
+      </div>
+
+      <div>
+        <h3 style={{ margin: "0 0 1.25rem", fontSize: "0.9rem", textTransform: "uppercase", letterSpacing: "0.06em", color: "#888" }}>
+          Hardware
+        </h3>
+        {hardware === null ? (
+          <p style={DESC_STYLE}>Loading…</p>
+        ) : hardware.active_provider === null ? (
+          <p style={DESC_STYLE}>Model not downloaded yet — provider will be detected on first use.</p>
+        ) : (() => {
+          const active = hardware.active_provider!;
+          const label = PROVIDER_LABELS[active] ?? active;
+          const isCpu = active === "CPUExecutionProvider";
+          const triedGpu = hardware.configured_providers.filter(
+            (p) => p !== "CPUExecutionProvider"
+          );
+          const triedAndFailed = isCpu && triedGpu.length > 0;
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+              <span style={{ fontWeight: 600, fontSize: "0.95rem" }}>{label}</span>
+              <p style={DESC_STYLE}>
+                {triedAndFailed
+                  ? `${triedGpu.map((p) => PROVIDER_LABELS[p] ?? p).join(", ")} failed to initialize — required CUDA/cuDNN/TensorRT libraries not found. Falling back to CPU.`
+                  : isCpu
+                  ? "No GPU providers configured. Running on CPU."
+                  : `${label} initialized successfully. Operations not supported by this provider fall back to CPU.`}
+              </p>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
