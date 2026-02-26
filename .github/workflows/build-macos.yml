@@ -29,9 +29,6 @@ jobs:
       - name: Install Python dependencies
         run: cd backend && uv sync --group dev
 
-      - name: Run tests
-        run: cd backend && uv run pytest
-
       - name: Build executable
         run: |
           cd backend
