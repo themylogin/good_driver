@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import importlib.util
 from pathlib import Path
 
 block_cipher = None
@@ -6,6 +7,9 @@ block_cipher = None
 ROOT = Path(SPECPATH).parent
 BACKEND = ROOT / "backend"
 FRONTEND_DIST = BACKEND / "frontend_dist"
+
+webview_origin = importlib.util.find_spec("webview").origin
+WEBVIEW_LIB = Path(webview_origin).parent / "lib"
 
 # NOTE: The ONNX model (yolopv2_384x640.onnx) is intentionally NOT bundled here.
 # It must be downloaded separately after installation via:  download-model
@@ -16,9 +20,10 @@ a = Analysis(
     pathex=[str(BACKEND)],
     datas=[
         (str(FRONTEND_DIST), "frontend_dist"),
+        (str(WEBVIEW_LIB), "webview/lib"),
     ],
     hiddenimports=[
-        "webview.platforms.winforms",
+        "webview.platforms.edgechromium",
         "clr",
         "good_driver",
         "good_driver.app",
