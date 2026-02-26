@@ -71,7 +71,7 @@ The server will be available at `http://localhost:8080`.
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Node.js 20+
-- **Linux**: GTK WebKit (`gir1.2-webkit2-4.1` package, usually pre-installed on Ubuntu/Fedora)
+- **Linux**: GTK WebKit (`gir1.2-webkit2-4.1` package, usually pre-installed on Ubuntu/Fedora) and GStreamer H.264 codec (`gstreamer1.0-libav`)
 
 ## Setup
 
