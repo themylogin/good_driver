@@ -21,6 +21,7 @@ a = Analysis(
     datas=[
         (str(FRONTEND_DIST), "frontend_dist"),
         (str(WEBVIEW_LIB), "webview/lib"),
+        (str(ROOT / "desktop" / "MicrosoftEdgeWebview2Setup.exe"), "."),
     ],
     hiddenimports=[
         "webview.platforms.edgechromium",

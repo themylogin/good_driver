@@ -18,6 +18,26 @@ def get_log_stream():
     return sys.stderr
 
 
+def _ensure_webview2():
+    import subprocess
+    import winreg
+
+    key_path = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path):
+            return
+    except FileNotFoundError:
+        pass
+
+    if getattr(sys, "frozen", False):
+        bootstrapper = Path(sys._MEIPASS) / "MicrosoftEdgeWebview2Setup.exe"
+    else:
+        bootstrapper = Path(__file__).parent / "MicrosoftEdgeWebview2Setup.exe"
+
+    if bootstrapper.exists():
+        subprocess.run([str(bootstrapper), "/silent", "/install"], check=False)
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -75,10 +95,12 @@ def main() -> None:
         sys.stderr.flush()
         sys.exit(1)
 
+    if sys.platform == "win32":
+        _ensure_webview2()
+
     import webview
 
-    if sys.platform == "win32":
-        webview.settings["WEBVIEW2_RUNTIME_PATH"] = "."
+    webview.settings["WEBVIEW2_RUNTIME_PATH"] = "."
 
     window = webview.create_window(
         "Good Driver",

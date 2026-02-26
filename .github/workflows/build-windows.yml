@@ -29,6 +29,9 @@ jobs:
       - name: Install Python dependencies
         run: cd backend && uv sync --group dev
 
+      - name: Download WebView2 bootstrapper
+        run: Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile desktop/MicrosoftEdgeWebview2Setup.exe
+
       - name: Build executable
         run: |
           cd backend
