@@ -39,6 +39,13 @@ if IS_WINDOWS:
         "webview.platforms.edgechromium",
         "clr",
     ]
+elif sys.platform == "darwin":
+    ort_libs = list(ORT_CAPI.glob("libonnxruntime*"))
+    platform_binaries = [(str(lib), "onnxruntime/capi") for lib in ort_libs]
+    platform_datas = []
+    platform_hiddenimports = [
+        "webview.platforms.cocoa",
+    ]
 else:
     ort_libs = list(ORT_CAPI.glob("libonnxruntime*"))
     platform_binaries = [(str(lib), "onnxruntime/capi") for lib in ort_libs]
