@@ -1,3 +1,4 @@
+import os
 import socket
 import sys
 import threading
@@ -6,16 +7,6 @@ from pathlib import Path
 
 import urllib.request
 import urllib.error
-
-
-def get_log_stream():
-    if sys.platform == "win32":
-        if getattr(sys, "frozen", False):
-            log_path = Path(sys.executable).parent / "good_driver.log"
-        else:
-            log_path = Path(__file__).parent / "good_driver.log"
-        return open(log_path, "w", buffering=1, encoding="utf-8")
-    return sys.stderr
 
 
 def _ensure_webview2():
@@ -36,8 +27,17 @@ def _ensure_webview2():
 
     if bootstrapper.exists():
         subprocess.run([str(bootstrapper), "/silent", "/install"], check=False)
-        # WebView2 was just installed; restart so the process picks it up
         os.execv(sys.executable, sys.argv)
+
+
+def get_log_stream():
+    if sys.platform == "win32":
+        if getattr(sys, "frozen", False):
+            log_path = Path(sys.executable).parent / "good_driver.log"
+        else:
+            log_path = Path(__file__).parent / "good_driver.log"
+        return open(log_path, "a", buffering=1, encoding="utf-8")
+    return sys.stderr
 
 
 def find_free_port() -> int:
@@ -77,8 +77,11 @@ def wait_for_server(port: int, timeout: float = 10.0) -> None:
 
 
 def main() -> None:
-    import os
     os.environ["GOOD_DRIVER_MODE"] = "desktop"
+
+    # Install WebView2 before anything else; restarts the process if needed
+    if sys.platform == "win32":
+        _ensure_webview2()
 
     log_stream = get_log_stream()
     if log_stream is not sys.stderr:
@@ -96,9 +99,6 @@ def main() -> None:
         sys.stderr.write(f"ERROR: {e}\n")
         sys.stderr.flush()
         sys.exit(1)
-
-    if sys.platform == "win32":
-        _ensure_webview2()
 
     import webview
 

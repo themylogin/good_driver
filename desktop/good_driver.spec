@@ -24,6 +24,7 @@ a = Analysis(
         (str(ROOT / "desktop" / "MicrosoftEdgeWebview2Setup.exe"), "."),
     ],
     hiddenimports=[
+        "pydantic_core._pydantic_core",
         "webview.platforms.winforms",
         "webview.platforms.edgechromium",
         "clr",
