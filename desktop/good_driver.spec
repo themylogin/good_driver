@@ -18,6 +18,8 @@ a = Analysis(
         (str(FRONTEND_DIST), "frontend_dist"),
     ],
     hiddenimports=[
+        "webview.platforms.winforms",
+        "clr",
         "good_driver",
         "good_driver.app",
         "good_driver.config",
