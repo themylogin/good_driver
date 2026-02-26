@@ -1,0 +1,41 @@
+name: Build Windows
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm install
+          npm run build
+          Copy-Item -Recurse -Force dist/* ../backend/frontend_dist/
+
+      - name: Install Python dependencies
+        run: cd backend && uv sync --group dev
+
+      - name: Build executable
+        run: |
+          cd backend
+          uv run pyinstaller ../desktop/good_driver.spec --distpath ../dist --workpath ../build --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: good_driver-windows
+          path: dist/good_driver.exe
