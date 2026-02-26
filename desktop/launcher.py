@@ -13,12 +13,17 @@ def _ensure_webview2():
     import subprocess
     import winreg
 
-    key_path = r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path):
-            return
-    except FileNotFoundError:
-        pass
+    webview2_key = r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    for hive, path in [
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\WOW6432Node\{webview2_key}"),
+        (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\{webview2_key}"),
+        (winreg.HKEY_CURRENT_USER, rf"SOFTWARE\{webview2_key}"),
+    ]:
+        try:
+            with winreg.OpenKey(hive, path):
+                return
+        except FileNotFoundError:
+            pass
 
     if getattr(sys, "frozen", False):
         bootstrapper = Path(sys._MEIPASS) / "MicrosoftEdgeWebview2Setup.exe"
@@ -27,7 +32,6 @@ def _ensure_webview2():
 
     if bootstrapper.exists():
         subprocess.run([str(bootstrapper), "/silent", "/install"], check=False)
-        os.execv(sys.executable, sys.argv)
 
 
 def get_log_stream():
