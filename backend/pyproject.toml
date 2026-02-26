@@ -2,15 +2,15 @@
 name = "good-driver"
 version = "0.1.0"
 description = "Good Driver"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "pywebview>=5",
     "pythonnet>=3.0; sys_platform == 'win32'",
     "numpy>=2.4.2",
-    "onnxruntime-gpu>=1.24.2; (sys_platform == 'linux' or sys_platform == 'win32') and platform_machine == 'x86_64'",
-    "onnxruntime>=1.24.2; sys_platform == 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime-windowsml>=1.23; sys_platform == 'win32' and platform_machine == 'x86_64'",
+    "onnxruntime>=1.24.2; sys_platform != 'win32' or platform_machine != 'x86_64'",
     "scipy>=1.17.0",
     "pillow>=12.1.1",
     "python-multipart>=0.0.22",

@@ -29,8 +29,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/footage")
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = PROJECT_ROOT / "data"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 # ---------------------------------------------------------------------------
@@ -38,7 +36,7 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 # ---------------------------------------------------------------------------
 
 _executor = ThreadPoolExecutor(max_workers=1)
-_processing_videos: set[str] = set()   # filenames currently queued or running
+_processing_videos: set[str] = set()   # "directory|filename" keys currently queued or running
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +58,8 @@ def _frame_file_path(data_dir: Path, frame_n: int) -> Path:
     return data_dir / str(prefix) / f"{mid2:02d}" / f"{last2:02d}.json"
 
 
-def _data_dir(filename: str) -> Path:
-    return DATA_DIR / f"{filename}.data"
+def _data_dir(base: Path, filename: str) -> Path:
+    return base / f"{filename}.data"
 
 
 def _read_metadata(data_dir: Path) -> dict | None:
@@ -220,10 +218,11 @@ def _infer_frame(
 # Background processing worker
 # ---------------------------------------------------------------------------
 
-def _process_video_worker(filename: str) -> None:
+def _process_video_worker(filename: str, directory: str, key: str) -> None:
     """Process all frames of a video and write frame-data JSON files."""
     try:
-        path = DATA_DIR / filename
+        data_dir = Path(directory)
+        path = data_dir / filename
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             logger.error("Cannot open video: %s", path)
@@ -233,7 +232,7 @@ def _process_video_worker(filename: str) -> None:
         orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        ddir = _data_dir(filename)
+        ddir = _data_dir(data_dir, filename)
         ddir.mkdir(exist_ok=True)
         _write_metadata(ddir, total, 0,
                         fps=cap.get(cv2.CAP_PROP_FPS),
@@ -279,31 +278,41 @@ def _process_video_worker(filename: str) -> None:
     except Exception:
         logger.exception("Error processing video %s", filename)
     finally:
-        _processing_videos.discard(filename)
+        _processing_videos.discard(key)
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
+def _video_entry(directory: Path, filename: str) -> dict:
+    """Build a video entry dict with a proxy URL served by the backend."""
+    from urllib.parse import quote
+    video_url = f"/api/footage/video?filename={quote(filename, safe='')}&directory={quote(str(directory), safe='')}"
+    return {"filename": filename, "video_url": video_url}
+
+
 @router.get("/list")
-async def list_videos():
-    """Return all video files in the data directory."""
-    if not DATA_DIR.exists():
-        raise HTTPException(404, f"Data directory not found: {DATA_DIR}")
+async def list_videos(directory: str):
+    """Return all video files in the given directory."""
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
+
     videos = sorted(
         f.name
-        for f in DATA_DIR.iterdir()
+        for f in data_dir.iterdir()
         if f.suffix.lower() in VIDEO_EXTENSIONS
     )
-    return {"videos": videos}
+    return {"videos": [_video_entry(data_dir, v) for v in videos]}
 
 
 @router.get("/video")
-async def serve_video(filename: str):
+async def serve_video(filename: str, directory: str):
     """Serve a video file with range-request support for seeking."""
-    path = (DATA_DIR / filename).resolve()
-    if not str(path).startswith(str(DATA_DIR.resolve())):
+    data_dir = Path(directory)
+    path = (data_dir / filename).resolve()
+    if not str(path).startswith(str(data_dir.resolve())):
         raise HTTPException(403, "Access denied")
     if not path.exists():
         raise HTTPException(404, "Video not found")
@@ -311,9 +320,9 @@ async def serve_video(filename: str):
 
 
 @router.get("/metadata")
-async def get_metadata(filename: str):
+async def get_metadata(filename: str, directory: str):
     """Return processing metadata for a video."""
-    ddir = _data_dir(filename)
+    ddir = _data_dir(Path(directory), filename)
     meta = _read_metadata(ddir)
     if meta is None:
         return {"total_frames": 0, "processed_frames": 0}
@@ -321,13 +330,13 @@ async def get_metadata(filename: str):
 
 
 @router.get("/frames")
-async def get_frames(filename: str, batch: int):
+async def get_frames(filename: str, batch: int, directory: str):
     """Return precomputed frame data for a batch of 100 frames.
 
     batch: integer batch index (frame_n // 100), e.g. batch=5 covers frames 500-599.
     Returns a JSON array of up to 100 frame dicts, each with 'frame', 'detections', 'lane_lines'.
     """
-    ddir = _data_dir(filename)
+    ddir = _data_dir(Path(directory), filename)
     fpath = _frame_file_path(ddir, batch * 100)
     if not fpath.exists():
         raise HTTPException(404, f"Batch {batch} not yet processed for {filename!r}")
@@ -335,29 +344,31 @@ async def get_frames(filename: str, batch: int):
 
 
 @router.post("/start-processing")
-async def start_processing():
+async def start_processing(directory: str):
     """Submit all unprocessed videos to the background worker pool."""
-    if not DATA_DIR.exists():
-        raise HTTPException(404, f"Data directory not found: {DATA_DIR}")
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
 
     started: list[str] = []
     videos = sorted(
         f.name
-        for f in DATA_DIR.iterdir()
+        for f in data_dir.iterdir()
         if f.suffix.lower() in VIDEO_EXTENSIONS
     )
 
     for filename in videos:
-        if filename in _processing_videos:
+        key = f"{directory}|{filename}"
+        if key in _processing_videos:
             continue  # already queued or running
 
-        ddir = _data_dir(filename)
+        ddir = _data_dir(data_dir, filename)
         meta = _read_metadata(ddir)
         if meta is not None and meta["processed_frames"] >= meta["total_frames"] > 0:
             continue  # already complete
 
-        _processing_videos.add(filename)
-        _executor.submit(_process_video_worker, filename)
+        _processing_videos.add(key)
+        _executor.submit(_process_video_worker, filename, directory, key)
         started.append(filename)
 
     return {"started": started}

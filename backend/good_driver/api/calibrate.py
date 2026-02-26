@@ -15,14 +15,12 @@ from pydantic import BaseModel
 from scipy.optimize import least_squares
 
 from good_driver.model import get_model_path
+from good_driver.config import get_data_dir
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/calibrate")
 
-# Project root: backend/good_driver/api/calibrate.py → ../../../../
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = PROJECT_ROOT / "data"
 MODEL_PATH = get_model_path()
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -31,14 +29,13 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _session = None
 
 # GPU providers tried in priority order; CPUExecutionProvider is always appended as fallback.
-_PREFERRED_PROVIDERS = [
-    "TensorrtExecutionProvider",
-    "CUDAExecutionProvider",
-    "ROCMExecutionProvider",
-    "DmlExecutionProvider",
-    "OpenVINOExecutionProvider",
-    "CoreMLExecutionProvider",
-]
+import sys as _sys
+if _sys.platform == "win32":
+    _PREFERRED_PROVIDERS = ["DmlExecutionProvider"]
+elif _sys.platform == "darwin":
+    _PREFERRED_PROVIDERS = ["CoreMLExecutionProvider"]
+else:
+    _PREFERRED_PROVIDERS = ["CUDAExecutionProvider", "ROCMExecutionProvider"]
 
 
 def _build_providers() -> list[str]:
@@ -51,8 +48,7 @@ def _build_providers() -> list[str]:
 
 
 def get_hardware_info() -> dict:
-    # Eagerly initialize the session if the model is available so we report
-    # the provider that ONNX Runtime actually selected after trying each one.
+    """Return info about which ONNX providers are configured and active."""
     if _session is None and MODEL_PATH.exists():
         try:
             _get_session()
@@ -312,9 +308,12 @@ def _save_sidecar(directory: Path, filename: str, data: dict) -> None:
 
 def _image_entry(directory: Path, filename: str) -> dict:
     sidecar = _load_sidecar(directory, filename)
+    abs_path = (directory / filename).resolve()
+    from urllib.parse import quote
+    image_url = f"/api/calibrate/image?path={quote(str(abs_path), safe='')}"
     return {
         "filename": filename,
-        "image_url": f"/api/calibrate/image?path={directory.name}/{filename}",
+        "image_url": image_url,
         "image_width": sidecar.get("image_width"),
         "image_height": sidecar.get("image_height"),
         "detections": sidecar.get("detections"),
@@ -395,28 +394,47 @@ def solve_camera_params(
 
 @router.post("/open-directory")
 async def open_directory():
-    """Open the debug data directory and return its image list."""
-    if not DATA_DIR.exists():
-        raise HTTPException(404, f"Data directory not found: {DATA_DIR}")
+    """Open a native folder-picker dialog and return the chosen directory path.
 
-    images = sorted(
-        f.name
-        for f in DATA_DIR.iterdir()
-        if f.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    In desktop mode opens a pywebview dialog.
+    In dev mode falls back to the project data directory.
+    """
+    from good_driver.config import get_mode, Mode
 
-    return {
-        "directory": str(DATA_DIR),
-        "images": [_image_entry(DATA_DIR, fn) for fn in images],
-    }
+    if get_mode() == Mode.DESKTOP:
+        import webview
+        windows = webview.windows
+        if not windows:
+            raise HTTPException(500, "No webview window available")
+        result = windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+        if not result:
+            raise HTTPException(400, "No directory selected")
+        directory = Path(result[0])
+    else:
+        directory = get_data_dir()
+
+    if not directory.exists():
+        raise HTTPException(404, f"Directory not found: {directory}")
+
+    return {"directory": str(directory)}
+
+
+@router.get("/images")
+async def list_images(directory: str):
+    """Return the image list for an already-chosen directory (no folder picker)."""
+    d = Path(directory)
+    if not d.exists():
+        raise HTTPException(404, f"Directory not found: {d}")
+
+    images = sorted(f.name for f in d.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS)
+    return {"images": [_image_entry(d, fn) for fn in images]}
 
 
 @router.get("/image")
 async def serve_image(path: str):
-    """Serve an image from the data directory. path = e.g. 'data/1.jpg'"""
-    # Sanitize: only allow files inside PROJECT_ROOT
-    resolved = (PROJECT_ROOT / path).resolve()
-    if not str(resolved).startswith(str(PROJECT_ROOT)):
+    """Serve a calibration image by its absolute path."""
+    resolved = Path(path).resolve()
+    if resolved.suffix.lower() not in IMAGE_EXTENSIONS:
         raise HTTPException(403, "Access denied")
     if not resolved.exists():
         raise HTTPException(404, "Image not found")
@@ -540,13 +558,13 @@ async def solve(req: SolveRequest):
 
 
 @router.get("/params")
-async def get_camera_params():
-    """Return solved camera parameters using the data directory's calibration images.
+async def get_camera_params(directory: str):
+    """Return solved camera parameters for the given directory's calibration images.
 
     Returns 404 if fewer than 2 images are fully annotated.
     Includes image_width and image_height so callers can scale fx to other resolutions.
     """
-    measurements = _collect_measurements(DATA_DIR)
+    measurements = _collect_measurements(Path(directory))
 
     if len(measurements) < 2:
         raise HTTPException(

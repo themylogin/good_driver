@@ -111,6 +111,7 @@ def main() -> None:
     # bypasses that check. The path doesn't exist, so edgechromium.py falls through
     # to the system-installed WebView2 runtime.
     webview.settings["WEBVIEW2_RUNTIME_PATH"] = "__force_edgechromium__"
+    webview.settings["OPEN_DEVTOOLS_IN_DEBUG"] = False
 
     window = webview.create_window(
         "Good Driver",
@@ -119,6 +120,10 @@ def main() -> None:
         height=800,
     )
     webview.start(func=window.restore, debug=True)
+
+    # Window closed — kill the process immediately so the uvicorn
+    # daemon thread doesn't keep it alive.
+    os._exit(0)
 
 
 if __name__ == "__main__":

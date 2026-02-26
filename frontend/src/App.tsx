@@ -17,7 +17,7 @@ type Tab = "settings" | "calibrate" | "upload" | "analytics";
 const TABS: { id: Tab; label: string }[] = [
   { id: "settings", label: "Settings" },
   { id: "calibrate", label: "Calibrate" },
-  { id: "upload", label: "Upload footage" },
+  { id: "upload", label: "Process footage" },
   { id: "analytics", label: "Analytics" },
 ];
 
@@ -245,7 +245,7 @@ export default function App() {
     setTabError(null);
     if (tabId === "upload") {
       // Always re-fetch params so they update after the user recalibrates
-      const res = await fetch("/api/calibrate/params");
+      const res = await fetch(`/api/calibrate/params?directory=${encodeURIComponent(directory!)}`);
       if (!res.ok) {
         setTabError("Complete camera calibration first (need ≥ 2 fully annotated images).");
         return;
@@ -348,7 +348,7 @@ export default function App() {
       <div style={{ flex: 1, overflow: "hidden" }}>
         {activeTab === "settings" && <Settings directory={directory} />}
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
-        {activeTab === "upload" && cameraParams && <UploadFootage cameraParams={cameraParams} />}
+        {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} />}
         {activeTab === "analytics" && <Analytics />}
       </div>
     </div>

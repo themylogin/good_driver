@@ -234,7 +234,7 @@ export default function Settings({ directory }: { directory: string }) {
               <span style={{ fontWeight: 600, fontSize: "0.95rem" }}>{label}</span>
               <p style={DESC_STYLE}>
                 {triedAndFailed
-                  ? `${triedGpu.map((p) => PROVIDER_LABELS[p] ?? p).join(", ")} failed to initialize — required CUDA/cuDNN/TensorRT libraries not found. Falling back to CPU.`
+                  ? `${triedGpu.map((p) => PROVIDER_LABELS[p] ?? p).join(", ")} failed to initialize. Falling back to CPU.`
                   : isCpu
                   ? "No GPU providers configured. Running on CPU."
                   : `${label} initialized successfully. Operations not supported by this provider fall back to CPU.`}

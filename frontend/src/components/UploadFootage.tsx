@@ -518,14 +518,20 @@ function VideoSubtitle({ meta }: { meta: VideoMeta }) {
 // ---------------------------------------------------------------------------
 
 interface UploadFootageProps {
+  directory: string;
   cameraParams: CameraParams;
 }
 
-export default function UploadFootage({ cameraParams }: UploadFootageProps) {
-  const [videos, setVideos] = useState<string[]>([]);
-  const [activeVideo, setActiveVideo] = useState<string | null>(null);
+interface VideoEntry {
+  filename: string;
+  video_url: string;
+}
+
+export default function UploadFootage({ directory, cameraParams }: UploadFootageProps) {
+  const [videos, setVideos] = useState<VideoEntry[]>([]);
+  const [activeVideo, setActiveVideo] = useState<VideoEntry | null>(null);
   const [metas, setMetas] = useState<Record<string, VideoMeta>>({});
-  const [isStarting, setIsStarting] = useState(false);
+  const [processingStarted, setProcessingStarted] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -542,49 +548,54 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
   const frameDataRef = useRef<FrameEntry | null>(null);
 
   // ── Fetch metadata for all videos ──────────────────────────────────────
-  const fetchAllMeta = useCallback(async (videoList: string[]) => {
+  const fetchAllMeta = useCallback(async (videoList: VideoEntry[]) => {
     const entries = await Promise.all(
-      videoList.map(async (filename) => {
-        const r = await fetch(`/api/footage/metadata?filename=${encodeURIComponent(filename)}`);
+      videoList.map(async (v) => {
+        const r = await fetch(`/api/footage/metadata?filename=${encodeURIComponent(v.filename)}&directory=${encodeURIComponent(directory)}`);
         const data = r.ok ? await r.json() : null;
-        return [filename, data] as [string, VideoMeta];
+        return [v.filename, data] as [string, VideoMeta];
       }),
     );
     setMetas(Object.fromEntries(entries));
-  }, []);
+  }, [directory]);
 
   // ── Load video list on mount ────────────────────────────────────────────
   useEffect(() => {
-    fetch("/api/footage/list")
+    fetch(`/api/footage/list?directory=${encodeURIComponent(directory)}`)
       .then((r) => r.json())
       .then((data) => {
-        const vids: string[] = data.videos ?? [];
+        const vids: VideoEntry[] = data.videos ?? [];
         setVideos(vids);
         if (vids.length > 0) setActiveVideo(vids[0]);
         fetchAllMeta(vids);
       })
       .catch((e) => setErrorMessage(String(e)));
-  }, [fetchAllMeta]);
+  }, [directory, fetchAllMeta]);
 
   // ── Set fps from metadata when a video is selected ─────────────────────
   useEffect(() => {
     if (!activeVideo) return;
-    const meta = metas[activeVideo];
+    const meta = metas[activeVideo.filename];
     if (meta?.fps) setFps(meta.fps);
     // Clear stale frame data when switching video
     batchCache.current = {};
     frameDataRef.current = null;
   }, [activeVideo, metas]);
 
-  // ── Poll metadata while any video is processing ─────────────────────────
-  const anyProcessing = Object.values(metas).some(
-    (m) => m !== null && m.total_frames > 0 && m.processed_frames < m.total_frames,
-  );
+  // ── Poll metadata while processing is active ────────────────────────────
+  const allComplete = videos.length > 0 && videos.every((v) => {
+    const m = metas[v.filename];
+    return m !== null && m !== undefined && m.total_frames > 0 && m.processed_frames >= m.total_frames;
+  });
+  // Clear the flag only when everything finishes
   useEffect(() => {
-    if (!anyProcessing || videos.length === 0) return;
+    if (allComplete) setProcessingStarted(false);
+  }, [allComplete]);
+  useEffect(() => {
+    if (!processingStarted || videos.length === 0) return;
     const id = setInterval(() => fetchAllMeta(videos), 2000);
     return () => clearInterval(id);
-  }, [anyProcessing, videos, fetchAllMeta]);
+  }, [processingStarted, videos, fetchAllMeta]);
 
   // ── Canvas drawing ──────────────────────────────────────────────────────
   const redraw = useCallback(() => {
@@ -632,8 +643,8 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
 
   // ── Load frame data for the given time and redraw ───────────────────────
   const loadFrameAndDraw = useCallback(async (time: number) => {
-    const video = activeVideo;
-    if (!video) return;
+    if (!activeVideo) return;
+    const filename = activeVideo.filename;
 
     const frameN = Math.floor(time * fps);
     const batchIdx = Math.floor(frameN / 100);
@@ -648,7 +659,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
     // Fetch batch
     try {
       const res = await fetch(
-        `/api/footage/frames?filename=${encodeURIComponent(video)}&batch=${batchIdx}`,
+        `/api/footage/frames?filename=${encodeURIComponent(filename)}&batch=${batchIdx}&directory=${encodeURIComponent(directory)}`,
       );
       if (!res.ok) {
         // Batch not yet processed — clear overlay
@@ -710,20 +721,17 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
   }, []);
 
   // ── "Start processing" ──────────────────────────────────────────────────
-  const allComplete = videos.length > 0 && videos.every((v) => {
-    const m = metas[v];
-    return m !== null && m !== undefined && m.total_frames > 0 && m.processed_frames >= m.total_frames;
-  });
-
   const handleStartProcessing = async () => {
-    setIsStarting(true);
+    setProcessingStarted(true);
     try {
-      await fetch("/api/footage/start-processing", { method: "POST" });
+      const res = await fetch(`/api/footage/start-processing?directory=${encodeURIComponent(directory)}`, { method: "POST" });
+      const data = await res.json();
+      const count = (data.started as string[])?.length ?? 0;
+      if (count === 0) setProcessingStarted(false);
       await fetchAllMeta(videos);
     } catch (e) {
+      setProcessingStarted(false);
       setErrorMessage(String(e));
-    } finally {
-      setIsStarting(false);
     }
   };
 
@@ -750,31 +758,31 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
               No videos found in directory
             </div>
           )}
-          {videos.map((filename) => (
+          {videos.map((v) => (
             <div
-              key={filename}
-              onClick={() => setActiveVideo(filename)}
+              key={v.filename}
+              onClick={() => setActiveVideo(v)}
               style={{
                 padding: "0.4rem 0.6rem",
                 marginBottom: "2px",
                 cursor: "pointer",
                 borderRadius: "4px",
-                background: activeVideo === filename ? "#e8f0fe" : "transparent",
+                background: activeVideo?.filename === v.filename ? "#e8f0fe" : "transparent",
                 fontSize: "0.875rem",
               }}
             >
               <div
                 style={{
-                  fontWeight: activeVideo === filename ? 600 : 400,
+                  fontWeight: activeVideo?.filename === v.filename ? 600 : 400,
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
                   color: "#000",
                 }}
               >
-                {filename}
+                {v.filename}
               </div>
-              <VideoSubtitle meta={metas[filename] ?? null} />
+              <VideoSubtitle meta={metas[v.filename] ?? null} />
             </div>
           ))}
         </div>
@@ -783,22 +791,20 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
         <div style={{ borderTop: "1px solid #ddd", padding: "0.75rem", flexShrink: 0 }}>
           <button
             onClick={handleStartProcessing}
-            disabled={isStarting || allComplete || anyProcessing || videos.length === 0}
+            disabled={allComplete || processingStarted || videos.length === 0}
             style={{
               width: "100%",
               padding: "0.5rem",
               border: "1px solid #ccc",
               borderRadius: "4px",
-              background: allComplete || anyProcessing ? "#f0f0f0" : "#0066cc",
-              color: allComplete || anyProcessing ? "#999" : "#fff",
-              cursor: isStarting || allComplete || anyProcessing ? "default" : "pointer",
+              background: allComplete || processingStarted ? "#f0f0f0" : "#0066cc",
+              color: allComplete || processingStarted ? "#999" : "#fff",
+              cursor: allComplete || processingStarted ? "default" : "pointer",
               fontSize: "0.9rem",
               fontFamily: "system-ui",
             }}
           >
-            {isStarting
-              ? "Starting…"
-              : anyProcessing
+            {processingStarted
               ? "Processing…"
               : allComplete
               ? "All complete"
@@ -816,9 +822,9 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
               {/* Video + detection overlay */}
               <div style={{ flex: 1, position: "relative", minWidth: 0 }}>
                 <video
-                  key={activeVideo}
+                  key={activeVideo.filename}
                   ref={videoRef}
-                  src={`/api/footage/video?filename=${encodeURIComponent(activeVideo)}`}
+                  src={activeVideo.video_url}
                   style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
@@ -946,7 +952,7 @@ export default function UploadFootage({ cameraParams }: UploadFootageProps) {
               color: "#999",
             }}
           >
-            {videos.length === 0 ? "No videos in directory" : "Select a video"}
+            {videos.length === 0 ? "No videos in directory" : "Select a video to view"}
           </div>
         )}
 

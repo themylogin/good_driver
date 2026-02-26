@@ -26,3 +26,16 @@ def get_frontend_dist_path() -> Path:
     if meipass:
         return Path(meipass) / "frontend_dist"
     return Path(__file__).resolve().parent.parent / "frontend_dist"
+
+
+def get_data_dir() -> Path:
+    """Return the user data directory (videos, calibration images, frame JSONs).
+
+    - Frozen binary: sibling ``data/`` directory next to the exe.
+    - Dev / run-desktop: ``<project_root>/data/``.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(sys.executable).parent / "data"
+    # config.py lives at backend/good_driver/config.py → parents[2] = project root
+    return Path(__file__).resolve().parents[2] / "data"

@@ -11,12 +11,12 @@ RESOURCES_URL = "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/326_YOL
 def get_model_path() -> Path:
     """Return the expected ONNX model path.
 
-    - Frozen binary (PyInstaller): next to the executable in a models/ subdirectory.
+    - Frozen binary (PyInstaller): same directory as the executable.
     - Dev / run-desktop: backend/models/ relative to this file.
     """
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        return Path(sys.executable).parent / "models" / MODEL_NAME
+        return Path(sys.executable).parent / MODEL_NAME
     return Path(__file__).resolve().parents[1] / "models" / MODEL_NAME
 
 

@@ -11,6 +11,9 @@ FRONTEND_DIST = BACKEND / "frontend_dist"
 webview_origin = importlib.util.find_spec("webview").origin
 WEBVIEW_LIB = Path(webview_origin).parent / "lib"
 
+ort_origin = importlib.util.find_spec("onnxruntime").origin
+ORT_CAPI = Path(ort_origin).parent / "capi"
+
 # NOTE: The ONNX model (yolopv2_384x640.onnx) is intentionally NOT bundled here.
 # It must be downloaded separately after installation via:  download-model
 # The launcher will check for the model on startup and prompt the user to download it.
@@ -18,6 +21,11 @@ WEBVIEW_LIB = Path(webview_origin).parent / "lib"
 a = Analysis(
     [str(ROOT / "desktop" / "launcher.py")],
     pathex=[str(BACKEND)],
+    binaries=[
+        (str(ORT_CAPI / "DirectML.dll"), "onnxruntime/capi"),
+        (str(ORT_CAPI / "onnxruntime.dll"), "onnxruntime/capi"),
+        (str(ORT_CAPI / "onnxruntime_providers_shared.dll"), "onnxruntime/capi"),
+    ],
     datas=[
         (str(FRONTEND_DIST), "frontend_dist"),
         (str(WEBVIEW_LIB), "webview/lib"),

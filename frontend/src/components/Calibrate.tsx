@@ -315,9 +315,9 @@ export default function Calibrate({ directory }: CalibrateProps) {
   const annotationTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
   const solveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load images on mount
+  // Load images when directory is set
   useEffect(() => {
-    fetch("/api/calibrate/open-directory", { method: "POST" })
+    fetch(`/api/calibrate/images?directory=${encodeURIComponent(directory)}`)
       .then((r) => r.json())
       .then((data) => {
         const images: CalibratedImage[] = (data.images ?? []).map(
