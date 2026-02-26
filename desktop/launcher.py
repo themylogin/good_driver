@@ -83,7 +83,7 @@ def main() -> None:
         width=1200,
         height=800,
     )
-    webview.start(func=window.restore)
+    webview.start(func=window.restore, debug=True, gui="edgechromium")
 
 
 if __name__ == "__main__":
