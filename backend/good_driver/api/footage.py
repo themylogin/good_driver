@@ -516,9 +516,9 @@ async def process_frame(filename: str, directory: str, frame: int):
 
     session = _get_session()
     result = _infer_frame(frame_bgr, orig_w, orig_h, session)
-    # Add dummy track_id so the frontend doesn't break
-    for det in result["detections"]:
-        det["track_id"] = 0
+    # Assign sequential track_ids so the frontend gives each car a different color
+    for i, det in enumerate(result["detections"]):
+        det["track_id"] = i
     result["frame"] = frame
     return result
 
