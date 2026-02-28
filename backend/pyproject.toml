@@ -17,6 +17,7 @@ dependencies = [
     "python-multipart>=0.0.22",
     "opencv-python-headless>=4.10",
     "httpx>=0.28",
+    "scikit-image>=0.26.0",
 ]
 
 [dependency-groups]

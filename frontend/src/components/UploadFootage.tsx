@@ -11,11 +11,17 @@ interface Detection {
   confidence: number;
 }
 
+interface LaneFit {
+  points: number[][];   // [[u,v], ...] RDP-simplified skeleton polyline
+  v_min: number;
+  v_max: number;
+}
+
 interface FrameEntry {
   frame: number;
   detections: Detection[];
   lane_lines: number[][][];           // [line][[x,y],...]
-  drivable_polygons?: number[][][];   // [polygon][[x,y],...]
+  lane_fits?: LaneFit[];              // cubic fits (parallel to lane_lines)
 }
 
 type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
@@ -119,6 +125,24 @@ function imageToWorld(
   return { X, Z };
 }
 
+/** Inverse of imageToWorld: project world ground-plane point back to image pixel. */
+function worldToImage(
+  X: number, Z: number,
+  videoW: number, videoH: number,
+  params: CameraParams,
+): { u: number; v: number } | null {
+  if (!params.fx || !params.image_width || !videoW || !videoH || Z <= 0) return null;
+  const fxScaled = params.fx * (videoW / params.image_width);
+  const cx = videoW / 2;
+  const cy = videoH / 2;
+  const pitchRad = params.pitch_degrees * (Math.PI / 180);
+  const angle = Math.atan(params.camera_height_m / Z);
+  const beta = angle - pitchRad;
+  const v = cy + fxScaled * Math.tan(beta);
+  const u = cx + X * fxScaled / Z;
+  return { u, v };
+}
+
 /** Compute letterbox transform for object-fit:contain video inside a canvas. */
 function letterboxTransform(
   canvasW: number, canvasH: number,
@@ -153,18 +177,99 @@ function drawOverlay(
   if (!tx) return;
   const { scale, offsetX, offsetY } = tx;
 
-  // ── Lane lines ──
-  ctx.strokeStyle = "#FFD700";
-  ctx.lineWidth = 2;
-  ctx.lineJoin = "round";
-  for (const line of frame.lane_lines) {
-    if (line.length < 2) continue;
-    ctx.beginPath();
-    ctx.moveTo(line[0][0] * scale + offsetX, line[0][1] * scale + offsetY);
-    for (let i = 1; i < line.length; i++) {
-      ctx.lineTo(line[i][0] * scale + offsetX, line[i][1] * scale + offsetY);
+  // ── Lane lines (skeleton polyline + world-space extrapolation) ──
+  const EXTEND_Z = 20; // metres to extrapolate in world space
+  if (frame.lane_fits && frame.lane_fits.length > 0) {
+    for (const fit of frame.lane_fits) {
+      const pts = fit.points;
+      if (!pts || pts.length < 2) continue;
+
+      // Solid segment: draw skeleton polyline
+      ctx.strokeStyle = "#FFD700";
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0] * scale + offsetX, pts[0][1] * scale + offsetY);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i][0] * scale + offsetX, pts[i][1] * scale + offsetY);
+      }
+      ctx.stroke();
+
+      // Dotted extensions using local direction at endpoints in world space
+      const worldPts = pts
+        .map(([u, v]) => imageToWorld(u, v, vw, vh, params))
+        .filter(Boolean) as { X: number; Z: number }[];
+      if (worldPts.length < 2) continue;
+
+      // Sort by Z ascending (near → far)
+      const sorted = [...worldPts].sort((a, b) => a.Z - b.Z);
+      const N_LOCAL = Math.min(5, Math.floor(sorted.length / 2));
+
+      ctx.setLineDash([6, 4]);
+
+      // Extension towards horizon: use last N_LOCAL points (far end)
+      if (N_LOCAL >= 2) {
+        const farPts = sorted.slice(-N_LOCAL);
+        const farFit = fitWorldQuadratic(farPts);
+        if (farFit) {
+          const maxZ = farPts[farPts.length - 1].Z;
+          const extPts: [number, number][] = [];
+          for (let i = 0; i <= 15; i++) {
+            const Z = maxZ + EXTEND_Z * i / 15;
+            const X = evalQuadratic(farFit, Z);
+            const img = worldToImage(X, Z, vw, vh, params);
+            if (img) extPts.push([img.u * scale + offsetX, img.v * scale + offsetY]);
+          }
+          if (extPts.length >= 2) {
+            ctx.beginPath();
+            ctx.moveTo(extPts[0][0], extPts[0][1]);
+            for (let i = 1; i < extPts.length; i++) ctx.lineTo(extPts[i][0], extPts[i][1]);
+            ctx.stroke();
+          }
+        }
+      }
+
+      // Extension towards car: use first N_LOCAL points (near end)
+      if (N_LOCAL >= 2) {
+        const nearPts = sorted.slice(0, N_LOCAL);
+        const nearFit = fitWorldQuadratic(nearPts);
+        if (nearFit) {
+          const minZ = nearPts[0].Z;
+          const extNearZ = Math.max(0.5, minZ - EXTEND_Z);
+          if (extNearZ < minZ) {
+            const extPts: [number, number][] = [];
+            for (let i = 0; i <= 15; i++) {
+              const Z = extNearZ + (minZ - extNearZ) * i / 15;
+              const X = evalQuadratic(nearFit, Z);
+              const img = worldToImage(X, Z, vw, vh, params);
+              if (img) extPts.push([img.u * scale + offsetX, img.v * scale + offsetY]);
+            }
+            if (extPts.length >= 2) {
+              ctx.beginPath();
+              ctx.moveTo(extPts[0][0], extPts[0][1]);
+              for (let i = 1; i < extPts.length; i++) ctx.lineTo(extPts[i][0], extPts[i][1]);
+              ctx.stroke();
+            }
+          }
+        }
+      }
+      ctx.setLineDash([]);
     }
-    ctx.stroke();
+  } else {
+    // Fallback: draw source points (no fits available)
+    ctx.strokeStyle = "#FFD700";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    for (const line of frame.lane_lines) {
+      if (line.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(line[0][0] * scale + offsetX, line[0][1] * scale + offsetY);
+      for (let i = 1; i < line.length; i++) {
+        ctx.lineTo(line[i][0] * scale + offsetX, line[i][1] * scale + offsetY);
+      }
+      ctx.stroke();
+    }
   }
 
   // ── Bounding boxes + labels ──
@@ -201,62 +306,113 @@ function drawOverlay(
 // Lane fitting helpers
 // ---------------------------------------------------------------------------
 
-
-/** Least-squares linear fit: X = a·Z + b */
-function fitLinear(pts: { X: number; Z: number }[]): { a: number; b: number } | null {
-  const n = pts.length;
-  if (n < 2) return null;
-  let sumZ = 0, sumX = 0, sumZZ = 0, sumXZ = 0;
-  for (const { X, Z } of pts) {
-    sumZ += Z; sumX += X; sumZZ += Z * Z; sumXZ += X * Z;
+/** Evaluate a lane fit at a given v by linearly interpolating between points. */
+function evalLaneFit(fit: LaneFit, v: number): number | null {
+  const pts = fit.points;
+  if (!pts || pts.length === 0) return null;
+  if (v < fit.v_min || v > fit.v_max) return null;
+  // Points are sorted by v (ascending). Binary search for the segment.
+  if (v <= pts[0][1]) return pts[0][0];
+  if (v >= pts[pts.length - 1][1]) return pts[pts.length - 1][0];
+  for (let i = 1; i < pts.length; i++) {
+    if (v <= pts[i][1]) {
+      const [u0, v0] = pts[i - 1];
+      const [u1, v1] = pts[i];
+      if (v1 === v0) return u0;
+      const t = (v - v0) / (v1 - v0);
+      return u0 + t * (u1 - u0);
+    }
   }
-  const denom = n * sumZZ - sumZ * sumZ;
-  if (Math.abs(denom) < 1e-9) return null;
-  const a = (n * sumXZ - sumX * sumZ) / denom;
-  const b = (sumX - a * sumZ) / n;
-  return { a, b };
+  return pts[pts.length - 1][0];
 }
 
 /**
- * Project + fit all lane lines in a frame to parallel world-space lines.
- * Returns deduped array sorted left-to-right.
+ * Fit a quadratic X = a*Z² + b*Z + c to world-space points using least squares.
+ * Falls back to linear if fewer than 3 points.
+ * Returns coefficients [a, b, c] such that X = a*Z² + b*Z + c.
  */
-function computeFittedLines(
-  frame: FrameEntry,
-  videoW: number,
-  videoH: number,
-  params: CameraParams,
-): { a: number; b: number }[] {
-  const linePts: { X: number; Z: number }[][] = [];
-  for (const line of frame.lane_lines) {
-    const pts = line
-      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
-      .filter(Boolean) as { X: number; Z: number }[];
-    if (pts.length >= 2) linePts.push(pts);
+function fitWorldQuadratic(worldPts: { X: number; Z: number }[]): [number, number, number] | null {
+  if (worldPts.length < 2) return null;
+  if (worldPts.length < 3) {
+    // Linear fallback: X = b*Z + c
+    const [p0, p1] = worldPts;
+    const dz = p1.Z - p0.Z;
+    if (Math.abs(dz) < 1e-12) return null;
+    const b = (p1.X - p0.X) / dz;
+    const c = p0.X - b * p0.Z;
+    return [0, b, c];
   }
-  if (linePts.length === 0) return [];
+  // Normal equations for X = a*Z² + b*Z + c
+  const n = worldPts.length;
+  let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+  let t0 = 0, t1 = 0, t2 = 0;
+  for (const { X, Z } of worldPts) {
+    const z2 = Z * Z;
+    s0 += 1; s1 += Z; s2 += z2; s3 += z2 * Z; s4 += z2 * z2;
+    t0 += X; t1 += X * Z; t2 += X * z2;
+  }
+  // Solve 3x3 system via Cramer's rule
+  //  s4*a + s3*b + s2*c = t2
+  //  s3*a + s2*b + s1*c = t1
+  //  s2*a + s1*b + s0*c = t0
+  const det =
+    s4 * (s2 * s0 - s1 * s1) -
+    s3 * (s3 * s0 - s1 * s2) +
+    s2 * (s3 * s1 - s2 * s2);
+  if (Math.abs(det) < 1e-12) return null;
+  const a = (
+    t2 * (s2 * s0 - s1 * s1) -
+    s3 * (t1 * s0 - s1 * t0) +
+    s2 * (t1 * s1 - s2 * t0)
+  ) / det;
+  const b = (
+    s4 * (t1 * s0 - s1 * t0) -
+    t2 * (s3 * s0 - s1 * s2) +
+    s2 * (s3 * t0 - t1 * s2)
+  ) / det;
+  const c = (
+    s4 * (s2 * t0 - t1 * s1) -
+    s3 * (s3 * t0 - t1 * s2) +
+    t2 * (s3 * s1 - s2 * s2)
+  ) / det;
+  return [a, b, c];
+}
 
-  const indivFits = linePts.map(fitLinear).filter(Boolean) as { a: number; b: number }[];
-  const sortedSlopes = indivFits.map(f => f.a).sort((p, q) => p - q);
-  const sharedA = sortedSlopes.length > 0
-    ? sortedSlopes[Math.floor(sortedSlopes.length / 2)]
-    : 0;
+/** Evaluate quadratic: X = coeffs[0]*Z² + coeffs[1]*Z + coeffs[2] */
+function evalQuadratic(coeffs: [number, number, number], Z: number): number {
+  return coeffs[0] * Z * Z + coeffs[1] * Z + coeffs[2];
+}
 
-  const fitted = linePts.map(pts => {
-    const b = pts.reduce((s, { X, Z }) => s + X - sharedA * Z, 0) / pts.length;
-    return { a: sharedA, b };
-  });
+/**
+ * Get usable lane fits from a frame, deduped and sorted left-to-right.
+ * Uses a reference v near the bottom of the image to determine ordering.
+ */
+function getValidLaneFits(frame: FrameEntry): LaneFit[] {
+  const fits = frame.lane_fits;
+  if (!fits || fits.length === 0) return [];
 
-  const REF_Z = 10;
-  fitted.sort((p, q) => (p.a * REF_Z + p.b) - (q.a * REF_Z + q.b));
+  // Sort by u at a reference v (near bottom of image = close to car)
+  const refV = Math.max(...fits.map(f => f.v_max));
+  const withU = fits
+    .map(f => ({ fit: f, u: evalLaneFit(f, refV) }))
+    .filter((x): x is { fit: LaneFit; u: number } => x.u !== null);
 
-  const MIN_LANE_GAP = 1.0;
-  return fitted.filter((line, i) => {
-    if (i === 0) return true;
-    const prevX = fitted[i - 1].a * REF_Z + fitted[i - 1].b;
-    const thisX = line.a * REF_Z + line.b;
-    return thisX - prevX >= MIN_LANE_GAP;
-  });
+  withU.sort((a, b) => a.u - b.u);
+
+  // Deduplicate: merge fits that are too close (< 30px apart at refV)
+  const MIN_GAP = 30;
+  const deduped: LaneFit[] = [];
+  for (const { fit, u } of withU) {
+    if (deduped.length === 0) {
+      deduped.push(fit);
+      continue;
+    }
+    const prevU = evalLaneFit(deduped[deduped.length - 1], refV);
+    if (prevU !== null && u - prevU >= MIN_GAP) {
+      deduped.push(fit);
+    }
+  }
+  return deduped;
 }
 
 /**
@@ -264,46 +420,48 @@ function computeFittedLines(
  *   0  = ego's lane
  *  +1  = one lane to the left
  *  -1  = one lane to the right
+ *
+ * Uses cubic fits evaluated at the car's v position — no extrapolation.
  */
 function computeLanes(
   frame: FrameEntry,
-  deduped: { a: number; b: number }[],
+  fits: LaneFit[],
   videoW: number,
   videoH: number,
   params: CameraParams,
 ): LaneMap {
   const lanes: LaneMap = new Map();
-  if (!videoW || !videoH) return lanes;
+  if (!videoW || !videoH || fits.length === 0) return lanes;
 
-  // Find which interval the ego vehicle (X=0) falls in at a small near depth
-  const EGO_Z = 2;
-  const lineXsAtEgo = deduped.map(({ a, b }) => a * EGO_Z + b).sort((p, q) => p - q);
+  // Ego vehicle is at u = videoW / 2, near the bottom of the frame.
+  const egoU = videoW / 2;
+  const egoV = Math.max(...fits.map(f => f.v_max));
 
-  function intervalOf(X: number, sortedXs: number[]): number {
-    // Returns 0 for X < sortedXs[0], k for sortedXs[k-1] <= X < sortedXs[k], n for X >= sortedXs[n-1]
-    for (let i = 0; i < sortedXs.length; i++) {
-      if (X < sortedXs[i]) return i;
+  function intervalOf(u: number, sortedUs: number[]): number {
+    for (let i = 0; i < sortedUs.length; i++) {
+      if (u < sortedUs[i]) return i;
     }
-    return sortedXs.length;
+    return sortedUs.length;
   }
 
-  const egoInterval = intervalOf(0, lineXsAtEgo);
+  const egoLineUs = fits.map(f => evalLaneFit(f, egoV)).filter((x): x is number => x !== null).sort((a, b) => a - b);
+  const egoInterval = intervalOf(egoU, egoLineUs);
 
   for (const det of frame.detections) {
-    const u = (det.x1 + det.x2) / 2;
-    const v = det.y2;
-    const world = imageToWorld(u, v, videoW, videoH, params);
-    if (!world) continue;
-    const { X: carX, Z: carZ } = world;
+    const carU = (det.x1 + det.x2) / 2;
+    const carV = det.y2;
 
-    const lineXsAtCar = deduped.map(({ a, b }) => a * carZ + b).sort((p, q) => p - q);
-    const carInterval = intervalOf(carX, lineXsAtCar);
+    // Evaluate each lane fit at the car's v position
+    const carLineUs = fits.map(f => evalLaneFit(f, carV)).filter((x): x is number => x !== null).sort((a, b) => a - b);
+    if (carLineUs.length === 0) continue;
 
-    // egoInterval - carInterval:  positive = car is to the LEFT  (lane +1, +2…)
-    //                             negative = car is to the RIGHT (lane -1, -2…)
+    const carInterval = intervalOf(carU, carLineUs);
     const laneIdx = egoInterval - carInterval;
 
-    const entry: CarInLane = { track_id: det.track_id, distance: Math.round(carZ * 10) / 10 };
+    const world = imageToWorld(carU, carV, videoW, videoH, params);
+    if (!world) continue;
+
+    const entry: CarInLane = { track_id: det.track_id, distance: Math.round(world.Z * 10) / 10 };
     if (!lanes.has(laneIdx)) lanes.set(laneIdx, []);
     lanes.get(laneIdx)!.push(entry);
   }
@@ -367,16 +525,84 @@ function drawBEV(
 
   if (!frame || !videoW || !videoH) return;
 
-  // ── Drivable area polygons ──
-  if (frame.drivable_polygons) {
-    ctx.fillStyle = "rgba(0, 180, 60, 0.25)";
-    ctx.strokeStyle = "rgba(0, 180, 60, 0.6)";
-    ctx.lineWidth = 1;
-    for (const poly of frame.drivable_polygons) {
-      const pts = poly
+
+  // ── Lane lines (skeleton polyline + world-space extrapolation) ──
+  const BEV_EXTEND_Z = 20; // metres to extrapolate in world space
+  if (frame.lane_fits && frame.lane_fits.length > 0) {
+    function strokeBEVPts(pts: [number, number][]) {
+      if (pts.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.stroke();
+    }
+
+    for (const fit of frame.lane_fits) {
+      const pts = fit.points;
+      if (!pts || pts.length < 2) continue;
+
+      // Project points to world space
+      const worldPts = pts
         .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
         .filter(Boolean) as { X: number; Z: number }[];
-      if (pts.length < 3) continue;
+      if (worldPts.length < 2) continue;
+
+      // Solid segment
+      ctx.strokeStyle = "#FFD700";
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.setLineDash([]);
+      strokeBEVPts(worldPts.map(w => worldToBEV(w.X, w.Z)));
+
+      // Dotted extensions using local direction at endpoints
+      const sorted = [...worldPts].sort((a, b) => a.Z - b.Z);
+      const N_LOCAL = Math.min(5, Math.floor(sorted.length / 2));
+
+      ctx.setLineDash([6, 4]);
+
+      // Extension towards horizon: last N_LOCAL points (far end)
+      if (N_LOCAL >= 2) {
+        const farPts = sorted.slice(-N_LOCAL);
+        const farFit = fitWorldQuadratic(farPts);
+        if (farFit) {
+          const maxZ = farPts[farPts.length - 1].Z;
+          const extPts: [number, number][] = [];
+          for (let i = 0; i <= 15; i++) {
+            const Z = maxZ + BEV_EXTEND_Z * i / 15;
+            extPts.push(worldToBEV(evalQuadratic(farFit, Z), Z));
+          }
+          strokeBEVPts(extPts);
+        }
+      }
+
+      // Extension towards car: first N_LOCAL points (near end)
+      if (N_LOCAL >= 2) {
+        const nearPts = sorted.slice(0, N_LOCAL);
+        const nearFit = fitWorldQuadratic(nearPts);
+        if (nearFit) {
+          const minZ = nearPts[0].Z;
+          const extNearZ = Math.max(0.5, minZ - BEV_EXTEND_Z);
+          if (extNearZ < minZ) {
+            const extPts: [number, number][] = [];
+            for (let i = 0; i <= 15; i++) {
+              const Z = extNearZ + (minZ - extNearZ) * i / 15;
+              extPts.push(worldToBEV(evalQuadratic(nearFit, Z), Z));
+            }
+            strokeBEVPts(extPts);
+          }
+        }
+      }
+      ctx.setLineDash([]);
+    }
+  } else {
+    ctx.strokeStyle = "#FFD700";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    for (const line of frame.lane_lines) {
+      const pts = line
+        .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
+        .filter(Boolean) as { X: number; Z: number }[];
+      if (pts.length < 2) continue;
       ctx.beginPath();
       const [bx0, by0] = worldToBEV(pts[0].X, pts[0].Z);
       ctx.moveTo(bx0, by0);
@@ -384,29 +610,8 @@ function drawBEV(
         const [bx, by] = worldToBEV(pts[i].X, pts[i].Z);
         ctx.lineTo(bx, by);
       }
-      ctx.closePath();
-      ctx.fill();
       ctx.stroke();
     }
-  }
-
-  // ── Lane lines ──
-  ctx.strokeStyle = "#FFD700";
-  ctx.lineWidth = 2;
-  ctx.lineJoin = "round";
-  for (const line of frame.lane_lines) {
-    const pts = line
-      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
-      .filter(Boolean) as { X: number; Z: number }[];
-    if (pts.length < 2) continue;
-    ctx.beginPath();
-    const [bx0, by0] = worldToBEV(pts[0].X, pts[0].Z);
-    ctx.moveTo(bx0, by0);
-    for (let i = 1; i < pts.length; i++) {
-      const [bx, by] = worldToBEV(pts[i].X, pts[i].Z);
-      ctx.lineTo(bx, by);
-    }
-    ctx.stroke();
   }
 
   // ── Vehicles ──
@@ -500,8 +705,8 @@ function drawLanesBEV(
   if (!frame || !videoW || !videoH) return;
 
   // ── Compute lane assignments ──
-  const deduped = computeFittedLines(frame, videoW, videoH, params);
-  const lanes    = computeLanes(frame, deduped, videoW, videoH, params);
+  const fits  = getValidLaneFits(frame);
+  const lanes = computeLanes(frame, fits, videoW, videoH, params);
 
   // ── Draw vehicles ──
   for (const [laneIdx, cars] of lanes) {
@@ -592,6 +797,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   const [duration, setDuration] = useState(0);
   const [fps, setFps] = useState(DEFAULT_FPS);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [debugImgUrl, setDebugImgUrl] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -636,7 +842,10 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
       .then((data) => {
         const vids: VideoEntry[] = data.videos ?? [];
         setVideos(vids);
-        if (vids.length > 0) setActiveVideo(vids[0]);
+        // Restore last active video from localStorage (dev only)
+        const savedFilename = import.meta.env.DEV ? localStorage.getItem("gd_activeVideo") : null;
+        const saved = savedFilename ? vids.find((v) => v.filename === savedFilename) : null;
+        setActiveVideo(saved ?? vids[0] ?? null);
         fetchAllMeta(vids);
       })
       .catch((e) => setErrorMessage(String(e)));
@@ -645,11 +854,13 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   // ── Set fps from metadata when a video is selected ─────────────────────
   useEffect(() => {
     if (!activeVideo) return;
+    if (import.meta.env.DEV) localStorage.setItem("gd_activeVideo", activeVideo.filename);
     const meta = metas[activeVideo.filename];
     if (meta?.fps) setFps(meta.fps);
     // Clear stale frame data when switching video
     batchCache.current = {};
     frameDataRef.current = null;
+    setDebugImgUrl(null);
   }, [activeVideo, metas]);
 
   // ── Poll metadata while processing is active ────────────────────────────
@@ -904,8 +1115,12 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   ref={videoRef}
                   src={activeVideo.video_url}
                   style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
-                  onPlay={() => setIsPlaying(true)}
-                  onPause={() => setIsPlaying(false)}
+                  onPlay={() => { setIsPlaying(true); setDebugImgUrl(null); }}
+                  onPause={() => {
+                    setIsPlaying(false);
+                    const vid = videoRef.current;
+                    if (vid && import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
+                  }}
                   onTimeUpdate={() => {
                     const vid = videoRef.current;
                     if (!vid) return;
@@ -914,18 +1129,37 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   }}
                   onSeeked={() => {
                     const vid = videoRef.current;
-                    if (vid) loadFrameAndDraw(vid.currentTime);
+                    if (vid) {
+                      loadFrameAndDraw(vid.currentTime);
+                      if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
+                    }
+                    setDebugImgUrl(null);
                   }}
                   onLoadedMetadata={() => {
                     const vid = videoRef.current;
                     if (vid) {
                       setDuration(vid.duration);
-                      setCurrentTime(0);
+                      const savedTime = import.meta.env.DEV ? parseFloat(localStorage.getItem("gd_currentTime") ?? "0") : 0;
+                      const t = Math.min(savedTime, vid.duration || 0);
+                      vid.currentTime = t;
+                      setCurrentTime(t);
                       setIsPlaying(false);
-                      loadFrameAndDraw(0);
+                      loadFrameAndDraw(t);
                     }
                   }}
                 />
+                {debugImgUrl && (
+                  <img
+                    src={debugImgUrl}
+                    style={{
+                      position: "absolute",
+                      top: 0, left: 0,
+                      width: "100%", height: "100%",
+                      objectFit: "contain",
+                      pointerEvents: "none",
+                    }}
+                  />
+                )}
                 <canvas
                   ref={canvasRef}
                   style={{
@@ -987,6 +1221,41 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   {isPlaying ? "⏸ Pause" : "▶ Play"}
                 </button>
                 <button onClick={() => stepFrame(1)} style={btnStyle}>Next ▶</button>
+                <button
+                  onClick={async () => {
+                    if (!activeVideo) return;
+                    const frameN = Math.floor(currentTime * fps);
+                    const res = await fetch(
+                      `/api/footage/debug-frame?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`,
+                    );
+                    if (!res.ok) return;
+                    const blob = await res.blob();
+                    if (debugImgUrl) URL.revokeObjectURL(debugImgUrl);
+                    setDebugImgUrl(URL.createObjectURL(blob));
+                    frameDataRef.current = null;
+                    redraw();
+                  }}
+                  style={btnStyle}
+                >
+                  Debug
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!activeVideo) return;
+                    const frameN = Math.floor(currentTime * fps);
+                    const res = await fetch(
+                      `/api/footage/process-frame?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`,
+                    );
+                    if (!res.ok) return;
+                    const data: FrameEntry = await res.json();
+                    frameDataRef.current = data;
+                    setDebugImgUrl(null);
+                    redraw();
+                  }}
+                  style={btnStyle}
+                >
+                  Process
+                </button>
                 <span
                   style={{
                     marginLeft: "0.5rem",
@@ -996,6 +1265,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   }}
                 >
                   {formatTime(currentTime)} / {formatTime(duration)}
+                  {" | "}Frame: {Math.floor(currentTime * fps)}
                 </span>
                 <label
                   style={{

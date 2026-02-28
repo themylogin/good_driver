@@ -9,9 +9,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from PIL import Image
-from scipy.interpolate import UnivariateSpline
+from skimage.morphology import skeletonize
 
 from .calibrate import (
     _CONF_THRESHOLD,
@@ -82,56 +82,6 @@ def _write_metadata(data_dir: Path, total: int, processed: int, **extra) -> None
     meta_path.write_text(json.dumps(meta))
 
 
-# ---------------------------------------------------------------------------
-# Drivable-area polygon extraction
-# ---------------------------------------------------------------------------
-
-_DRIVABLE_THRESHOLD = 0.5
-_MIN_DRIVABLE_AREA  = 500   # ignore tiny blobs (in model-space pixels)
-_POLY_EPSILON_FRAC  = 0.002 # approxPolyDP epsilon as fraction of perimeter
-
-
-def _mask_to_drivable_polygons(
-    seg_logits: np.ndarray,
-    orig_w: int,
-    orig_h: int,
-) -> list[list[list[float]]]:
-    """
-    Convert the drivable-area segmentation output to a list of polygons.
-
-    seg_logits: shape [1, C, H, W].
-      - C=2: two-class logits  → argmax to get binary mask
-      - C=1: single-channel probability → threshold at _DRIVABLE_THRESHOLD
-    Returns: [[[x, y], ...], ...]  in original video pixel space.
-    """
-    inner = seg_logits[0]  # [C, H, W]
-    if inner.shape[0] == 1:
-        mask = (inner[0] > _DRIVABLE_THRESHOLD).astype(np.uint8)
-    else:
-        mask = inner.argmax(axis=0).astype(np.uint8)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    sx = orig_w / _INPUT_W
-    sy = orig_h / _INPUT_H
-    polygons: list[list[list[float]]] = []
-
-    for cnt in contours:
-        if cv2.contourArea(cnt) < _MIN_DRIVABLE_AREA:
-            continue
-
-        epsilon = _POLY_EPSILON_FRAC * cv2.arcLength(cnt, closed=True)
-        approx = cv2.approxPolyDP(cnt, epsilon, closed=True)
-
-        pts = [
-            [round(float(pt[0][0] * sx), 1), round(float(pt[0][1] * sy), 1)]
-            for pt in approx
-        ]
-        if len(pts) >= 3:
-            polygons.append(pts)
-
-    return polygons
-
 
 # ---------------------------------------------------------------------------
 # Lane-line vectorization
@@ -139,28 +89,84 @@ def _mask_to_drivable_polygons(
 
 _MIN_LANE_PIXELS = 30   # ignore tiny blobs
 _MIN_UNIQUE_Y    = 5    # need vertical spread for a meaningful spline
-_LANE_SAMPLES    = 20   # number of points per vectorised lane
-
 
 _LANE_THRESHOLD = 0.5
+_DRIVABLE_THRESHOLD = 0.5
+
+
+_RDP_EPSILON = 1.5  # Ramer-Douglas-Peucker tolerance in model-space pixels
+
+
+def _vectorize_component(
+    comp_mask: np.ndarray,
+    sx: float,
+    sy: float,
+) -> list[dict]:
+    """
+    Vectorize one connected component into one or more lane dicts.
+
+    Skeletonizes the mask to get 1px-wide center lines, splits at
+    junction pixels, then simplifies with RDP and scales to original
+    image space.
+    """
+    skeleton = skeletonize(comp_mask > 0).astype(np.uint8)
+
+    # Find junction pixels (>2 skeleton neighbors) and remove them to split branches
+    neighbor_count = cv2.filter2D(skeleton, -1, np.ones((3, 3), dtype=np.uint8)) * skeleton
+    junctions = (neighbor_count > 3).astype(np.uint8)
+    skel_split = skeleton.copy()
+    skel_split[cv2.dilate(junctions, np.ones((3, 3), dtype=np.uint8)) > 0] = 0
+
+    n_branches, branch_labels = cv2.connectedComponents(skel_split, connectivity=8)
+
+    results = []
+    for branch in range(1, n_branches):
+        bys, bxs = np.where(branch_labels == branch)
+        unique_ys = np.sort(np.unique(bys))
+        if len(unique_ys) < _MIN_UNIQUE_Y:
+            continue
+        mean_xs = np.array([float(bxs[bys == y].mean()) for y in unique_ys])
+
+        # Build polyline in model space and simplify with RDP
+        polyline = np.column_stack([mean_xs, unique_ys]).astype(np.float32)
+        simplified = cv2.approxPolyDP(polyline, _RDP_EPSILON, closed=False)
+        simplified = simplified.reshape(-1, 2)
+        if len(simplified) < 2:
+            continue
+
+        # Scale to original image space
+        pts = [
+            [round(float(x * sx), 1), round(float(y * sy), 1)]
+            for x, y in simplified
+        ]
+        v_vals = [p[1] for p in pts]
+        results.append({
+            "points": pts,
+            "v_min": round(min(v_vals), 1),
+            "v_max": round(max(v_vals), 1),
+        })
+    return results
 
 
 def _mask_to_lane_lines(
     lane_logits: np.ndarray,
     orig_w: int,
     orig_h: int,
-) -> list[list[list[float]]]:
+) -> list[dict]:
     """
-    Convert the lane-line segmentation output to a list of smooth polylines.
+    Convert the lane-line segmentation output to a list of lane dicts.
 
     lane_logits: shape [1, C, H, W].
       - C=2: two-class logits  → argmax to get binary mask
       - C=1: single-channel probability in [0,1] → threshold at _LANE_THRESHOLD
-    Returns: [[[x, y], ...], ...]  in original video pixel space.
+
+    Returns: list of lane dicts, each with:
+      - "points": [[u, v], ...]  polyline in original video pixel space
+      - "cubic":  [a3, a2, a1, a0]  polynomial coefficients for u(v)
+      - "v_min", "v_max": valid range for the polynomial
     """
     inner = lane_logits[0]           # [C, H, W]
     if inner.shape[0] == 1:
-        # Single-channel probability map (post-sigmoid)
         mask = (inner[0] > _LANE_THRESHOLD).astype(np.uint8)
     else:
         mask = inner.argmax(axis=0).astype(np.uint8)
@@ -169,43 +175,15 @@ def _mask_to_lane_lines(
 
     sx = orig_w / _INPUT_W
     sy = orig_h / _INPUT_H
-    lines: list[list[list[float]]] = []
+    lanes: list[dict] = []
 
     for lbl in range(1, n_labels):
         if stats[lbl, cv2.CC_STAT_AREA] < _MIN_LANE_PIXELS:
             continue
+        comp_mask = (labels == lbl).astype(np.uint8)
+        lanes.extend(_vectorize_component(comp_mask, sx, sy))
 
-        ys, xs = np.where(labels == lbl)
-
-        if len(np.unique(ys)) < _MIN_UNIQUE_Y:
-            continue
-
-        # Average x per unique y row (avoids duplicate-y issues for the spline)
-        unique_ys = np.unique(ys)
-        mean_xs = np.array([xs[ys == y].mean() for y in unique_ys], dtype=float)
-
-        if len(unique_ys) < _MIN_UNIQUE_Y:
-            continue
-
-        try:
-            k = min(2, len(unique_ys) - 1)
-            spline = UnivariateSpline(unique_ys, mean_xs, k=k, s=len(unique_ys) * 4)
-        except Exception:
-            continue
-
-        y_samples = np.linspace(float(unique_ys[0]), float(unique_ys[-1]), _LANE_SAMPLES)
-        x_samples = spline(y_samples)
-
-        pts = [
-            [round(float(x * sx), 1), round(float(y * sy), 1)]
-            for x, y in zip(x_samples, y_samples)
-            if np.isfinite(x) and np.isfinite(y)
-        ]
-        if len(pts) < 2:
-            continue
-        lines.append(pts)
-
-    return lines
+    return lanes
 
 
 # ---------------------------------------------------------------------------
@@ -258,22 +236,27 @@ def _infer_frame(
     # ── Lane lines ──
     # outputs[1] is the lane-line segmentation head when len(outputs) >= 5
     lane_lines: list = []
+    lane_fits: list = []
     if len(outputs) >= 5 and outputs[1] is not None:
         try:
-            lane_lines = _mask_to_lane_lines(outputs[1], orig_w, orig_h)
+            lane_dicts = _mask_to_lane_lines(outputs[1], orig_w, orig_h)
+            lane_lines = [ld["points"] for ld in lane_dicts]
+            lane_fits = [
+                {
+                    "points": ld["points"],
+                    "v_min": ld["v_min"],
+                    "v_max": ld["v_max"],
+                }
+                for ld in lane_dicts
+            ]
         except Exception as e:
             logger.warning("Lane vectorization failed: %s", e)
 
-    # ── Drivable area ──
-    # outputs[0] is the drivable-area segmentation head
-    drivable_polygons: list = []
-    if len(outputs) >= 5 and outputs[0] is not None:
-        try:
-            drivable_polygons = _mask_to_drivable_polygons(outputs[0], orig_w, orig_h)
-        except Exception as e:
-            logger.warning("Drivable polygon extraction failed: %s", e)
-
-    return {"detections": detections, "lane_lines": lane_lines, "drivable_polygons": drivable_polygons}
+    return {
+        "detections": detections,
+        "lane_lines": lane_lines,
+        "lane_fits": lane_fits,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +406,121 @@ async def get_frames(filename: str, batch: int, directory: str):
     if not fpath.exists():
         raise HTTPException(404, f"Batch {batch} not yet processed for {filename!r}")
     return json.loads(gzip.decompress(fpath.read_bytes()))
+
+
+@router.get("/debug-frame")
+async def debug_frame(filename: str, directory: str, frame: int):
+    """Return a JPEG with raw segmentation masks + lane polylines overlaid on the frame."""
+    path = Path(directory) / filename
+    if not path.exists():
+        raise HTTPException(404, f"Video not found: {path}")
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise HTTPException(500, f"Cannot open video: {path}")
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        ok, frame_bgr = cap.read()
+        if not ok:
+            raise HTTPException(400, f"Cannot read frame {frame}")
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+
+    # Run model
+    session = _get_session()
+    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    tensor, sx, sy = _preprocess(img)
+    outputs = session.run(None, {session.get_inputs()[0].name: tensor})
+
+    # Build overlay on the original frame (RGB)
+    base = np.array(img, dtype=np.float32)
+    overlay = base.copy()
+    alpha = 0.4
+
+    # Driveable area mask → green
+    if len(outputs) >= 5 and outputs[0] is not None:
+        seg_inner = outputs[0][0]
+        if seg_inner.shape[0] == 1:
+            seg_mask = (seg_inner[0] > _DRIVABLE_THRESHOLD).astype(np.uint8)
+        else:
+            seg_mask = seg_inner.argmax(axis=0).astype(np.uint8)
+        seg_full = cv2.resize(seg_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        driveable = seg_full == 1
+        if driveable.any():
+            overlay[driveable] = base[driveable] * (1 - alpha) + np.array([0, 255, 0]) * alpha
+
+    # Lane mask → red
+    if len(outputs) >= 5 and outputs[1] is not None:
+        ll_inner = outputs[1][0]
+        if ll_inner.shape[0] == 1:
+            ll_mask = (ll_inner[0] > _LANE_THRESHOLD).astype(np.uint8)
+        else:
+            ll_mask = ll_inner.argmax(axis=0).astype(np.uint8)
+        ll_full = cv2.resize(ll_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        lanes = ll_full == 1
+        if lanes.any():
+            overlay[lanes] = base[lanes] * (1 - alpha) + np.array([255, 0, 0]) * alpha
+
+    result = overlay.astype(np.uint8)
+
+    # Draw raw skeleton pixels (yellow) — shows skeletonize output before spline fitting
+    if len(outputs) >= 5 and outputs[1] is not None:
+        try:
+            ll_inner2 = outputs[1][0]
+            if ll_inner2.shape[0] == 1:
+                ll_m = (ll_inner2[0] > _LANE_THRESHOLD).astype(np.uint8)
+            else:
+                ll_m = ll_inner2.argmax(axis=0).astype(np.uint8)
+            n_lbl, lbl_map, st, _ = cv2.connectedComponentsWithStats(ll_m, connectivity=8)
+            sx = orig_w / _INPUT_W
+            sy = orig_h / _INPUT_H
+            for lbl in range(1, n_lbl):
+                if st[lbl, cv2.CC_STAT_AREA] < _MIN_LANE_PIXELS:
+                    continue
+                comp = (lbl_map == lbl).astype(np.uint8)
+                skel = skeletonize(comp > 0).astype(np.uint8)
+                skel_full = cv2.resize(skel, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                result[skel_full == 1] = (255, 255, 0)
+        except Exception:
+            pass
+
+    # Encode as JPEG
+    rgb_to_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+    _, jpeg = cv2.imencode(".jpg", rgb_to_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+
+
+@router.get("/process-frame")
+async def process_frame(filename: str, directory: str, frame: int):
+    """Run inference on a single video frame without writing results to disk."""
+    path = Path(directory) / filename
+    if not path.exists():
+        raise HTTPException(404, f"Video not found: {path}")
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise HTTPException(500, f"Cannot open video: {path}")
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        ok, frame_bgr = cap.read()
+        if not ok:
+            raise HTTPException(400, f"Cannot read frame {frame}")
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+
+    session = _get_session()
+    result = _infer_frame(frame_bgr, orig_w, orig_h, session)
+    # Add dummy track_id so the frontend doesn't break
+    for det in result["detections"]:
+        det["track_id"] = 0
+    result["frame"] = frame
+    return result
 
 
 @router.post("/start-processing")
