@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -48,15 +49,15 @@ def _frame_file_path(data_dir: Path, frame_n: int) -> Path:
     """
     Encode frame_n into a 3-level tiled path.
 
-    frame 0        → file_idx 0  → 0/00/00.json  (covers frames 0–99)
-    frame 234500   → file_idx 2345  → 0/23/45.json
-    frame 1234500  → file_idx 12345 → 1/23/45.json
+    frame 0        → file_idx 0  → 0/00/00.json.gz  (covers frames 0–99)
+    frame 234500   → file_idx 2345  → 0/23/45.json.gz
+    frame 1234500  → file_idx 12345 → 1/23/45.json.gz
     """
     file_idx = frame_n // 100
     last2  = file_idx % 100
     mid2   = (file_idx // 100) % 100
     prefix = file_idx // 10000
-    return data_dir / str(prefix) / f"{mid2:02d}" / f"{last2:02d}.json"
+    return data_dir / str(prefix) / f"{mid2:02d}" / f"{last2:02d}.json.gz"
 
 
 def _data_dir(base: Path, filename: str) -> Path:
@@ -79,6 +80,57 @@ def _write_metadata(data_dir: Path, total: int, processed: int, **extra) -> None
     meta.update({"total_frames": total, "processed_frames": processed})
     meta.update(extra)
     meta_path.write_text(json.dumps(meta))
+
+
+# ---------------------------------------------------------------------------
+# Drivable-area polygon extraction
+# ---------------------------------------------------------------------------
+
+_DRIVABLE_THRESHOLD = 0.5
+_MIN_DRIVABLE_AREA  = 500   # ignore tiny blobs (in model-space pixels)
+_POLY_EPSILON_FRAC  = 0.002 # approxPolyDP epsilon as fraction of perimeter
+
+
+def _mask_to_drivable_polygons(
+    seg_logits: np.ndarray,
+    orig_w: int,
+    orig_h: int,
+) -> list[list[list[float]]]:
+    """
+    Convert the drivable-area segmentation output to a list of polygons.
+
+    seg_logits: shape [1, C, H, W].
+      - C=2: two-class logits  → argmax to get binary mask
+      - C=1: single-channel probability → threshold at _DRIVABLE_THRESHOLD
+    Returns: [[[x, y], ...], ...]  in original video pixel space.
+    """
+    inner = seg_logits[0]  # [C, H, W]
+    if inner.shape[0] == 1:
+        mask = (inner[0] > _DRIVABLE_THRESHOLD).astype(np.uint8)
+    else:
+        mask = inner.argmax(axis=0).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    sx = orig_w / _INPUT_W
+    sy = orig_h / _INPUT_H
+    polygons: list[list[list[float]]] = []
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) < _MIN_DRIVABLE_AREA:
+            continue
+
+        epsilon = _POLY_EPSILON_FRAC * cv2.arcLength(cnt, closed=True)
+        approx = cv2.approxPolyDP(cnt, epsilon, closed=True)
+
+        pts = [
+            [round(float(pt[0][0] * sx), 1), round(float(pt[0][1] * sy), 1)]
+            for pt in approx
+        ]
+        if len(pts) >= 3:
+            polygons.append(pts)
+
+    return polygons
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +264,16 @@ def _infer_frame(
         except Exception as e:
             logger.warning("Lane vectorization failed: %s", e)
 
-    return {"detections": detections, "lane_lines": lane_lines}
+    # ── Drivable area ──
+    # outputs[0] is the drivable-area segmentation head
+    drivable_polygons: list = []
+    if len(outputs) >= 5 and outputs[0] is not None:
+        try:
+            drivable_polygons = _mask_to_drivable_polygons(outputs[0], orig_w, orig_h)
+        except Exception as e:
+            logger.warning("Drivable polygon extraction failed: %s", e)
+
+    return {"detections": detections, "lane_lines": lane_lines, "drivable_polygons": drivable_polygons}
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +332,7 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
                 first_frame = frame_n - 99
                 fpath = _frame_file_path(ddir, first_frame)
                 fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_text(json.dumps(batch))
+                fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
                 _write_metadata(ddir, total, frame_n + 1)
                 batch = []
 
@@ -361,7 +422,7 @@ async def get_frames(filename: str, batch: int, directory: str):
     fpath = _frame_file_path(ddir, batch * 100)
     if not fpath.exists():
         raise HTTPException(404, f"Batch {batch} not yet processed for {filename!r}")
-    return json.loads(fpath.read_text())
+    return json.loads(gzip.decompress(fpath.read_bytes()))
 
 
 @router.post("/start-processing")

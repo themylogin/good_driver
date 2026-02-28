@@ -14,7 +14,8 @@ interface Detection {
 interface FrameEntry {
   frame: number;
   detections: Detection[];
-  lane_lines: number[][][];  // [line][[x,y],...]
+  lane_lines: number[][][];           // [line][[x,y],...]
+  drivable_polygons?: number[][][];   // [polygon][[x,y],...]
 }
 
 type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
@@ -365,6 +366,29 @@ function drawBEV(
   }
 
   if (!frame || !videoW || !videoH) return;
+
+  // ── Drivable area polygons ──
+  if (frame.drivable_polygons) {
+    ctx.fillStyle = "rgba(0, 180, 60, 0.25)";
+    ctx.strokeStyle = "rgba(0, 180, 60, 0.6)";
+    ctx.lineWidth = 1;
+    for (const poly of frame.drivable_polygons) {
+      const pts = poly
+        .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
+        .filter(Boolean) as { X: number; Z: number }[];
+      if (pts.length < 3) continue;
+      ctx.beginPath();
+      const [bx0, by0] = worldToBEV(pts[0].X, pts[0].Z);
+      ctx.moveTo(bx0, by0);
+      for (let i = 1; i < pts.length; i++) {
+        const [bx, by] = worldToBEV(pts[i].X, pts[i].Z);
+        ctx.lineTo(bx, by);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
 
   // ── Lane lines ──
   ctx.strokeStyle = "#FFD700";
