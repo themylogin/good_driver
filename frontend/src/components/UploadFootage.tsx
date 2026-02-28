@@ -495,7 +495,12 @@ function computeLanes(
     .sort((a, b) => a - b);
   const egoInterval = intervalOf(0, egoLineXs);
 
+  const EDGE_MARGIN = 5; // pixels
+
   for (const det of frame.detections) {
+    // Skip vehicles clipped at the frame edge — their true center is unknown
+    if (det.x2 >= videoW - EDGE_MARGIN || det.x1 <= EDGE_MARGIN) continue;
+
     const carU = (det.x1 + det.x2) / 2;
     const carV = det.y2;
 
