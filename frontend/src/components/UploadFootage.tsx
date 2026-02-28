@@ -306,25 +306,6 @@ function drawOverlay(
 // Lane fitting helpers
 // ---------------------------------------------------------------------------
 
-/** Evaluate a lane fit at a given v by linearly interpolating between points. */
-function evalLaneFit(fit: LaneFit, v: number): number | null {
-  const pts = fit.points;
-  if (!pts || pts.length === 0) return null;
-  if (v < fit.v_min || v > fit.v_max) return null;
-  // Points are sorted by v (ascending). Binary search for the segment.
-  if (v <= pts[0][1]) return pts[0][0];
-  if (v >= pts[pts.length - 1][1]) return pts[pts.length - 1][0];
-  for (let i = 1; i < pts.length; i++) {
-    if (v <= pts[i][1]) {
-      const [u0, v0] = pts[i - 1];
-      const [u1, v1] = pts[i];
-      if (v1 === v0) return u0;
-      const t = (v - v0) / (v1 - v0);
-      return u0 + t * (u1 - u0);
-    }
-  }
-  return pts[pts.length - 1][0];
-}
 
 /**
  * Fit a quadratic X = a*Z² + b*Z + c to world-space points using least squares.
@@ -343,7 +324,6 @@ function fitWorldQuadratic(worldPts: { X: number; Z: number }[]): [number, numbe
     return [0, b, c];
   }
   // Normal equations for X = a*Z² + b*Z + c
-  const n = worldPts.length;
   let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
   let t0 = 0, t1 = 0, t2 = 0;
   for (const { X, Z } of worldPts) {
@@ -383,33 +363,99 @@ function evalQuadratic(coeffs: [number, number, number], Z: number): number {
   return coeffs[0] * Z * Z + coeffs[1] * Z + coeffs[2];
 }
 
+/** A lane fit projected to world space: sorted (X, Z) pairs for interpolation. */
+interface WorldLane {
+  fit: LaneFit;
+  worldPts: { X: number; Z: number }[];  // sorted by Z ascending
+}
+
+/**
+ * Interpolate a world-space lane's X position at a given Z.
+ * Uses linear interpolation between the two bracketing points.
+ * Extrapolates using the quadratic fit of the nearest endpoint points.
+ */
+function evalWorldLaneX(wl: WorldLane, Z: number): number | null {
+  const pts = wl.worldPts;
+  if (pts.length === 0) return null;
+  if (pts.length === 1) return pts[0].X;
+
+  // Within range: linear interpolation
+  if (Z >= pts[0].Z && Z <= pts[pts.length - 1].Z) {
+    for (let i = 1; i < pts.length; i++) {
+      if (Z <= pts[i].Z) {
+        const { X: x0, Z: z0 } = pts[i - 1];
+        const { X: x1, Z: z1 } = pts[i];
+        if (z1 === z0) return x0;
+        const t = (Z - z0) / (z1 - z0);
+        return x0 + t * (x1 - x0);
+      }
+    }
+  }
+
+  // Extrapolate using quadratic fit of nearest 5 points
+  const N = Math.min(5, pts.length);
+  if (Z < pts[0].Z) {
+    const fit = fitWorldQuadratic(pts.slice(0, N));
+    return fit ? evalQuadratic(fit, Z) : null;
+  } else {
+    const fit = fitWorldQuadratic(pts.slice(-N));
+    return fit ? evalQuadratic(fit, Z) : null;
+  }
+}
+
+/**
+ * Build world-space lane representations from lane fits.
+ * Projects each lane's points to world space and sorts by Z.
+ */
+function buildWorldLanes(
+  fits: LaneFit[],
+  videoW: number, videoH: number,
+  params: CameraParams,
+): WorldLane[] {
+  return fits.map(fit => {
+    const worldPts = fit.points
+      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
+      .filter(Boolean) as { X: number; Z: number }[];
+    worldPts.sort((a, b) => a.Z - b.Z);
+    return { fit, worldPts };
+  }).filter(wl => wl.worldPts.length >= 2);
+}
+
 /**
  * Get usable lane fits from a frame, deduped and sorted left-to-right.
- * Uses a reference v near the bottom of the image to determine ordering.
+ * Uses world-space X position at a near-car Z to determine ordering.
  */
-function getValidLaneFits(frame: FrameEntry): LaneFit[] {
+function getValidLaneFits(
+  frame: FrameEntry,
+  videoW: number, videoH: number,
+  params: CameraParams,
+): WorldLane[] {
   const fits = frame.lane_fits;
   if (!fits || fits.length === 0) return [];
 
-  // Sort by u at a reference v (near bottom of image = close to car)
-  const refV = Math.max(...fits.map(f => f.v_max));
-  const withU = fits
-    .map(f => ({ fit: f, u: evalLaneFit(f, refV) }))
-    .filter((x): x is { fit: LaneFit; u: number } => x.u !== null);
+  const wLanes = buildWorldLanes(fits, videoW, videoH, params);
+  if (wLanes.length === 0) return [];
 
-  withU.sort((a, b) => a.u - b.u);
+  // Reference Z: the smallest max-Z across all lanes (closest common depth)
+  const refZ = Math.min(...wLanes.map(wl => wl.worldPts[wl.worldPts.length - 1].Z));
+  const withX = wLanes
+    .map(wl => ({ wl, x: evalWorldLaneX(wl, refZ) }))
+    .filter((e): e is { wl: WorldLane; x: number } => e.x !== null);
 
-  // Deduplicate: merge fits that are too close (< 30px apart at refV)
-  const MIN_GAP = 30;
-  const deduped: LaneFit[] = [];
-  for (const { fit, u } of withU) {
+  // Sort left-to-right (negative X = left, positive X = right)
+  withX.sort((a, b) => a.x - b.x);
+
+  // Deduplicate: merge lanes that are too close (< 0.5m apart at refZ)
+  const MIN_GAP_M = 0.5;
+  const deduped: WorldLane[] = [];
+  for (const { wl, x } of withX) {
     if (deduped.length === 0) {
-      deduped.push(fit);
+      deduped.push(wl);
       continue;
     }
-    const prevU = evalLaneFit(deduped[deduped.length - 1], refV);
-    if (prevU !== null && u - prevU >= MIN_GAP) {
-      deduped.push(fit);
+    const prevX = evalWorldLaneX(deduped[deduped.length - 1], refZ);
+    if (prevX !== null && x - prevX >= MIN_GAP_M) {
+      deduped.push(wl);
     }
   }
   return deduped;
@@ -421,45 +467,50 @@ function getValidLaneFits(frame: FrameEntry): LaneFit[] {
  *  +1  = one lane to the left
  *  -1  = one lane to the right
  *
- * Uses cubic fits evaluated at the car's v position — no extrapolation.
+ * Works entirely in world space: projects car and lane lines to ground plane,
+ * determines lane intervals by lateral X position at the car's Z depth.
  */
 function computeLanes(
   frame: FrameEntry,
-  fits: LaneFit[],
+  wLanes: WorldLane[],
   videoW: number,
   videoH: number,
   params: CameraParams,
 ): LaneMap {
   const lanes: LaneMap = new Map();
-  if (!videoW || !videoH || fits.length === 0) return lanes;
+  if (!videoW || !videoH || wLanes.length === 0) return lanes;
 
-  // Ego vehicle is at u = videoW / 2, near the bottom of the frame.
-  const egoU = videoW / 2;
-  const egoV = Math.max(...fits.map(f => f.v_max));
-
-  function intervalOf(u: number, sortedUs: number[]): number {
-    for (let i = 0; i < sortedUs.length; i++) {
-      if (u < sortedUs[i]) return i;
+  function intervalOf(x: number, sortedXs: number[]): number {
+    for (let i = 0; i < sortedXs.length; i++) {
+      if (x < sortedXs[i]) return i;
     }
-    return sortedUs.length;
+    return sortedXs.length;
   }
 
-  const egoLineUs = fits.map(f => evalLaneFit(f, egoV)).filter((x): x is number => x !== null).sort((a, b) => a - b);
-  const egoInterval = intervalOf(egoU, egoLineUs);
+  // Ego is at X=0 in world space. Determine ego's interval at a reference Z.
+  const egoRefZ = 5; // 5 metres ahead
+  const egoLineXs = wLanes
+    .map(wl => evalWorldLaneX(wl, egoRefZ))
+    .filter((x): x is number => x !== null)
+    .sort((a, b) => a - b);
+  const egoInterval = intervalOf(0, egoLineXs);
 
   for (const det of frame.detections) {
     const carU = (det.x1 + det.x2) / 2;
     const carV = det.y2;
 
-    // Evaluate each lane fit at the car's v position
-    const carLineUs = fits.map(f => evalLaneFit(f, carV)).filter((x): x is number => x !== null).sort((a, b) => a - b);
-    if (carLineUs.length === 0) continue;
-
-    const carInterval = intervalOf(carU, carLineUs);
-    const laneIdx = egoInterval - carInterval;
-
     const world = imageToWorld(carU, carV, videoW, videoH, params);
     if (!world) continue;
+
+    // Evaluate each lane's X at the car's Z depth
+    const carLineXs = wLanes
+      .map(wl => evalWorldLaneX(wl, world.Z))
+      .filter((x): x is number => x !== null)
+      .sort((a, b) => a - b);
+    if (carLineXs.length === 0) continue;
+
+    const carInterval = intervalOf(world.X, carLineXs);
+    const laneIdx = egoInterval - carInterval;
 
     const entry: CarInLane = { track_id: det.track_id, distance: Math.round(world.Z * 10) / 10 };
     if (!lanes.has(laneIdx)) lanes.set(laneIdx, []);
@@ -705,8 +756,8 @@ function drawLanesBEV(
   if (!frame || !videoW || !videoH) return;
 
   // ── Compute lane assignments ──
-  const fits  = getValidLaneFits(frame);
-  const lanes = computeLanes(frame, fits, videoW, videoH, params);
+  const wLanes = getValidLaneFits(frame, videoW, videoH, params);
+  const lanes  = computeLanes(frame, wLanes, videoW, videoH, params);
 
   // ── Draw vehicles ──
   for (const [laneIdx, cars] of lanes) {
