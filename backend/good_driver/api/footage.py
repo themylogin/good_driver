@@ -94,6 +94,7 @@ _LANE_THRESHOLD = 0.5
 _DRIVABLE_THRESHOLD = 0.5
 
 
+_SKEL_BORDER  = 5    # discard skeleton pixels within this margin of image edges
 _RDP_EPSILON = 1.5  # Ramer-Douglas-Peucker tolerance in model-space pixels
 
 
@@ -110,6 +111,13 @@ def _vectorize_component(
     image space.
     """
     skeleton = skeletonize(comp_mask > 0).astype(np.uint8)
+
+    # Discard border pixels — skeleton is unreliable at image edges
+    h, w = skeleton.shape
+    skeleton[:_SKEL_BORDER, :] = 0
+    skeleton[h - _SKEL_BORDER:, :] = 0
+    skeleton[:, :_SKEL_BORDER] = 0
+    skeleton[:, w - _SKEL_BORDER:] = 0
 
     # Find junction pixels (>2 skeleton neighbors) and remove them to split branches
     neighbor_count = cv2.filter2D(skeleton, -1, np.ones((3, 3), dtype=np.uint8)) * skeleton
@@ -452,7 +460,8 @@ async def debug_frame(filename: str, directory: str, frame: int):
         if driveable.any():
             overlay[driveable] = base[driveable] * (1 - alpha) + np.array([0, 255, 0]) * alpha
 
-    # Lane mask → red
+    # Lane mask → red overlay + yellow skeleton pixels
+    ll_mask = None
     if len(outputs) >= 5 and outputs[1] is not None:
         ll_inner = outputs[1][0]
         if ll_inner.shape[0] == 1:
@@ -466,15 +475,10 @@ async def debug_frame(filename: str, directory: str, frame: int):
 
     result = overlay.astype(np.uint8)
 
-    # Draw raw skeleton pixels (yellow) — shows skeletonize output before spline fitting
-    if len(outputs) >= 5 and outputs[1] is not None:
+    # Draw raw skeleton pixels (yellow) — reuse ll_mask from above
+    if ll_mask is not None:
         try:
-            ll_inner2 = outputs[1][0]
-            if ll_inner2.shape[0] == 1:
-                ll_m = (ll_inner2[0] > _LANE_THRESHOLD).astype(np.uint8)
-            else:
-                ll_m = ll_inner2.argmax(axis=0).astype(np.uint8)
-            n_lbl, lbl_map, st, _ = cv2.connectedComponentsWithStats(ll_m, connectivity=8)
+            n_lbl, lbl_map, st, _ = cv2.connectedComponentsWithStats(ll_mask, connectivity=8)
             sx = orig_w / _INPUT_W
             sy = orig_h / _INPUT_H
             for lbl in range(1, n_lbl):
