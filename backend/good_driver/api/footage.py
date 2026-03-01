@@ -99,6 +99,54 @@ _JUNCTION_DILATE_K = 7    # kernel size for erasing skeleton around junctions (l
 _RDP_EPSILON = 1.5  # Ramer-Douglas-Peucker tolerance in model-space pixels
 
 
+def _trace_skeleton_branch(bxs: np.ndarray, bys: np.ndarray) -> np.ndarray:
+    """Trace skeleton pixels in connectivity order, starting from an endpoint."""
+    n = len(bxs)
+    coords = np.column_stack([bxs, bys])
+    visited = np.zeros(n, dtype=bool)
+
+    # Build a spatial lookup: (x, y) → index
+    lookup: dict[tuple[int, int], int] = {}
+    for i in range(n):
+        lookup[(int(bxs[i]), int(bys[i]))] = i
+
+    # Find an endpoint (pixel with fewest skeleton neighbors) to start from.
+    # Prefer a true endpoint (1 neighbor); fall back to min-y pixel.
+    best_idx = 0
+    best_neighbors = 9
+    for i in range(n):
+        x, y = int(bxs[i]), int(bys[i])
+        nb = sum(
+            1 for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if (dx or dy) and (x + dx, y + dy) in lookup
+        )
+        if nb < best_neighbors:
+            best_neighbors = nb
+            best_idx = i
+
+    # Walk along the skeleton
+    order = []
+    cur = best_idx
+    while cur is not None:
+        visited[cur] = True
+        order.append(cur)
+        x, y = int(coords[cur, 0]), int(coords[cur, 1])
+        nxt = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                j = lookup.get((x + dx, y + dy))
+                if j is not None and not visited[j]:
+                    nxt = j
+                    break
+            if nxt is not None:
+                break
+        cur = nxt
+
+    return coords[order].astype(np.float32)
+
+
 def _vectorize_component(
     comp_mask: np.ndarray,
     sx: float,
@@ -131,13 +179,11 @@ def _vectorize_component(
     results = []
     for branch in range(1, n_branches):
         bys, bxs = np.where(branch_labels == branch)
-        unique_ys = np.sort(np.unique(bys))
-        if len(unique_ys) < _MIN_UNIQUE_Y:
+        if len(bys) < _MIN_UNIQUE_Y:
             continue
-        mean_xs = np.array([float(bxs[bys == y].mean()) for y in unique_ys])
 
-        # Build polyline in model space and simplify with RDP
-        polyline = np.column_stack([mean_xs, unique_ys]).astype(np.float32)
+        # Trace skeleton pixels in connectivity order instead of sorting by Y
+        polyline = _trace_skeleton_branch(bxs, bys)
         simplified = cv2.approxPolyDP(polyline, _RDP_EPSILON, closed=False)
         simplified = simplified.reshape(-1, 2)
         if len(simplified) < 2:
