@@ -3,6 +3,7 @@ import Calibrate from "./components/Calibrate";
 import UploadFootage from "./components/UploadFootage";
 import Analytics from "./components/Analytics";
 import Settings from "./components/Settings";
+import DebugImages from "./components/DebugImages";
 
 export interface CameraParams {
   fx: number;
@@ -12,7 +13,7 @@ export interface CameraParams {
   image_height: number;
 }
 
-type Tab = "settings" | "calibrate" | "upload" | "analytics";
+type Tab = "settings" | "calibrate" | "upload" | "analytics" | "debug";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "settings", label: "Settings" },
@@ -47,6 +48,16 @@ export default function App() {
   const [openError, setOpenError] = useState<string | null>(null);
   const [cameraParams, setCameraParams] = useState<CameraParams | null>(null);
   const [tabError, setTabError] = useState<string | null>(null);
+  const [hasDebugDir, setHasDebugDir] = useState(false);
+
+  // Check for Debug subdirectory
+  useEffect(() => {
+    if (!directory) return;
+    fetch(`/api/footage/debug-images?directory=${encodeURIComponent(directory)}`)
+      .then((r) => r.json())
+      .then((data) => setHasDebugDir((data.images?.length ?? 0) > 0))
+      .catch(() => setHasDebugDir(false));
+  }, [directory]);
 
   useEffect(() => {
     (async () => {
@@ -315,6 +326,25 @@ export default function App() {
             {tab.label}
           </button>
         ))}
+        {hasDebugDir && (
+          <button
+            onClick={() => handleTabClick("debug")}
+            style={{
+              padding: "0.75rem 1.5rem",
+              border: "none",
+              borderBottom: activeTab === "debug" ? "2px solid #0066cc" : "2px solid transparent",
+              marginBottom: "-2px",
+              background: "none",
+              cursor: "pointer",
+              fontFamily: "system-ui",
+              fontSize: "1rem",
+              color: activeTab === "debug" ? "#0066cc" : "#555",
+              fontWeight: activeTab === "debug" ? 600 : 400,
+            }}
+          >
+            Debug
+          </button>
+        )}
         <div style={{ marginLeft: "auto", padding: "0.5rem 1rem", fontSize: "0.8rem", color: "#999", alignSelf: "center" }}>
           {directory.split("/").pop()}
         </div>
@@ -350,6 +380,7 @@ export default function App() {
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
         {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} />}
         {activeTab === "analytics" && <Analytics />}
+        {activeTab === "debug" && <DebugImages directory={directory!} />}
       </div>
     </div>
   );

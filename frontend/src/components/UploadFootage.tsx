@@ -19,19 +19,6 @@ interface FrameEntry {
 
 type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
 
-/** A detected vehicle assigned to a lane. */
-interface CarInLane {
-  track_id: number;
-  distance: number;  // metres forward
-}
-
-/**
- * lanes[0]  = ego lane
- * lanes[1]  = one lane to the left
- * lanes[-1] = one lane to the right
- * etc.
- */
-type LaneMap = Map<number, CarInLane[]>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,13 +31,6 @@ const BOX_COLORS = [
   "#8E24AA", "#00ACC1", "#F4511E", "#039BE5",
 ];
 
-const BEV_MAX_DIST = 100;  // meters forward
-const BEV_HALF_WIDTH = 8;  // meters each side
-
-// Schematic (equal-width) lanes BEV
-const SCHEMA_MIN_LANE = -2;  // rightmost lane shown  (negative = right of ego)
-const SCHEMA_MAX_LANE = 2;   // leftmost lane shown   (positive = left of ego)
-const SCHEMA_N_LANES  = SCHEMA_MAX_LANE - SCHEMA_MIN_LANE + 1;  // 5
 
 const btnStyle: React.CSSProperties = {
   padding: "0.3rem 0.7rem",
@@ -197,12 +177,12 @@ function drawOverlay(
 
       // Sort by Z ascending (near → far)
       const sorted = [...worldPts].sort((a, b) => a.Z - b.Z);
-      const N_LOCAL = Math.min(5, Math.floor(sorted.length / 2));
+      const N_LOCAL = Math.min(5, Math.max(2, Math.floor(sorted.length / 2)));
 
       ctx.setLineDash([6, 4]);
 
       // Extension towards horizon: use last N_LOCAL points (far end)
-      if (N_LOCAL >= 2) {
+      if (sorted.length >= 2) {
         const farPts = sorted.slice(-N_LOCAL);
         const farFit = fitWorldQuadratic(farPts);
         if (farFit) {
@@ -224,7 +204,7 @@ function drawOverlay(
       }
 
       // Extension towards car: use first N_LOCAL points (near end)
-      if (N_LOCAL >= 2) {
+      if (sorted.length >= 2) {
         const nearPts = sorted.slice(0, N_LOCAL);
         const nearFit = fitWorldQuadratic(nearPts);
         if (nearFit) {
@@ -342,406 +322,6 @@ function evalQuadratic(coeffs: [number, number, number], Z: number): number {
   return coeffs[0] * Z * Z + coeffs[1] * Z + coeffs[2];
 }
 
-/** A lane line projected to world space: sorted (X, Z) pairs for interpolation. */
-interface WorldLane {
-  points: number[][];
-  worldPts: { X: number; Z: number }[];  // sorted by Z ascending
-}
-
-/**
- * Interpolate a world-space lane's X position at a given Z.
- * Uses linear interpolation between the two bracketing points.
- * Extrapolates using the quadratic fit of the nearest endpoint points.
- */
-function evalWorldLaneX(wl: WorldLane, Z: number): number | null {
-  const pts = wl.worldPts;
-  if (pts.length === 0) return null;
-  if (pts.length === 1) return pts[0].X;
-
-  // Within range: linear interpolation
-  if (Z >= pts[0].Z && Z <= pts[pts.length - 1].Z) {
-    for (let i = 1; i < pts.length; i++) {
-      if (Z <= pts[i].Z) {
-        const { X: x0, Z: z0 } = pts[i - 1];
-        const { X: x1, Z: z1 } = pts[i];
-        if (z1 === z0) return x0;
-        const t = (Z - z0) / (z1 - z0);
-        return x0 + t * (x1 - x0);
-      }
-    }
-  }
-
-  // Extrapolate using quadratic fit of nearest 5 points
-  const N = Math.min(5, pts.length);
-  if (Z < pts[0].Z) {
-    const fit = fitWorldQuadratic(pts.slice(0, N));
-    return fit ? evalQuadratic(fit, Z) : null;
-  } else {
-    const fit = fitWorldQuadratic(pts.slice(-N));
-    return fit ? evalQuadratic(fit, Z) : null;
-  }
-}
-
-/**
- * Build world-space lane representations from lane lines.
- * Projects each lane's points to world space and sorts by Z.
- */
-function buildWorldLanes(
-  lines: number[][][],
-  videoW: number, videoH: number,
-  params: CameraParams,
-): WorldLane[] {
-  return lines.map(line => {
-    const worldPts = line
-      .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
-      .filter(Boolean) as { X: number; Z: number }[];
-    worldPts.sort((a, b) => a.Z - b.Z);
-    return { points: line, worldPts };
-  }).filter(wl => wl.worldPts.length >= 2);
-}
-
-/**
- * Get usable lane lines from a frame, deduped and sorted left-to-right.
- * Uses world-space X position at a near-car Z to determine ordering.
- */
-function getValidLaneFits(
-  frame: FrameEntry,
-  videoW: number, videoH: number,
-  params: CameraParams,
-): WorldLane[] {
-  const lines = frame.lane_lines;
-  if (!lines || lines.length === 0) return [];
-
-  const wLanes = buildWorldLanes(lines, videoW, videoH, params);
-  if (wLanes.length === 0) return [];
-
-  // Reference Z: the smallest max-Z across all lanes (closest common depth)
-  const refZ = Math.min(...wLanes.map(wl => wl.worldPts[wl.worldPts.length - 1].Z));
-  const withX = wLanes
-    .map(wl => ({ wl, x: evalWorldLaneX(wl, refZ) }))
-    .filter((e): e is { wl: WorldLane; x: number } => e.x !== null);
-
-  // Sort left-to-right (negative X = left, positive X = right)
-  withX.sort((a, b) => a.x - b.x);
-
-  // Deduplicate: merge lanes that are too close (< 0.5m apart at refZ)
-  const MIN_GAP_M = 0.5;
-  const deduped: WorldLane[] = [];
-  for (const { wl, x } of withX) {
-    if (deduped.length === 0) {
-      deduped.push(wl);
-      continue;
-    }
-    const prevX = evalWorldLaneX(deduped[deduped.length - 1], refZ);
-    if (prevX !== null && x - prevX >= MIN_GAP_M) {
-      deduped.push(wl);
-    }
-  }
-  return deduped;
-}
-
-/**
- * Assign each detected vehicle to a lane index relative to the ego vehicle.
- *   0  = ego's lane
- *  +1  = one lane to the left
- *  -1  = one lane to the right
- *
- * Works entirely in world space: projects car and lane lines to ground plane,
- * determines lane intervals by lateral X position at the car's Z depth.
- */
-function computeLanes(
-  frame: FrameEntry,
-  wLanes: WorldLane[],
-  videoW: number,
-  videoH: number,
-  params: CameraParams,
-): LaneMap {
-  const lanes: LaneMap = new Map();
-  if (!videoW || !videoH || wLanes.length === 0) return lanes;
-
-  function intervalOf(x: number, sortedXs: number[]): number {
-    for (let i = 0; i < sortedXs.length; i++) {
-      if (x < sortedXs[i]) return i;
-    }
-    return sortedXs.length;
-  }
-
-  // Ego is at X=0 in world space. Determine ego's interval at a reference Z.
-  const egoRefZ = 5; // 5 metres ahead
-  const egoLineXs = wLanes
-    .map(wl => evalWorldLaneX(wl, egoRefZ))
-    .filter((x): x is number => x !== null)
-    .sort((a, b) => a - b);
-  const egoInterval = intervalOf(0, egoLineXs);
-
-  const EDGE_MARGIN = 5; // pixels
-
-  for (const det of frame.detections) {
-    // Skip vehicles clipped at the frame edge — their true center is unknown
-    if (det.x2 >= videoW - EDGE_MARGIN || det.x1 <= EDGE_MARGIN) continue;
-
-    const carU = (det.x1 + det.x2) / 2;
-    const carV = det.y2;
-
-    const world = imageToWorld(carU, carV, videoW, videoH, params);
-    if (!world) continue;
-
-    // Evaluate each lane's X at the car's Z depth
-    const carLineXs = wLanes
-      .map(wl => evalWorldLaneX(wl, world.Z))
-      .filter((x): x is number => x !== null)
-      .sort((a, b) => a - b);
-    if (carLineXs.length === 0) continue;
-
-    const carInterval = intervalOf(world.X, carLineXs);
-    const laneIdx = egoInterval - carInterval;
-
-    const entry: CarInLane = { track_id: det.track_id, distance: Math.round(world.Z * 10) / 10 };
-    if (!lanes.has(laneIdx)) lanes.set(laneIdx, []);
-    lanes.get(laneIdx)!.push(entry);
-  }
-  return lanes;
-}
-
-// ---------------------------------------------------------------------------
-// Bird's Eye View drawing
-// ---------------------------------------------------------------------------
-
-function drawBEV(
-  bevCanvas: HTMLCanvasElement,
-  frame: FrameEntry | null,
-  params: CameraParams,
-  videoW: number,
-  videoH: number,
-) {
-  const ctx = bevCanvas.getContext("2d")!;
-  const W = bevCanvas.width;
-  const H = bevCanvas.height;
-  if (!W || !H) return;
-
-  // Pixels per metre – fit BEV_MAX_DIST vertically and BEV_HALF_WIDTH*2 horizontally
-  const scaleZ = H / BEV_MAX_DIST;
-  const scaleX = (W / 2) / BEV_HALF_WIDTH;
-  const ppm = Math.min(scaleZ, scaleX);  // pixels per metre
-
-  const cxBEV = W / 2;
-
-  function worldToBEV(X: number, Z: number): [number, number] {
-    return [cxBEV + X * ppm, H - Z * ppm];
-  }
-
-  // Background
-  ctx.fillStyle = "#464646";
-  ctx.fillRect(0, 0, W, H);
-
-  // Grid
-  ctx.lineWidth = 1;
-  ctx.font = "11px system-ui";
-  ctx.textAlign = "left";
-
-  // Centre (forward) line
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.beginPath();
-  ctx.moveTo(cxBEV, H);
-  ctx.lineTo(cxBEV, 0);
-  ctx.stroke();
-
-  // Distance rings
-  for (let z = 5; z <= BEV_MAX_DIST; z += 5) {
-    const [, gy] = worldToBEV(0, z);
-    ctx.strokeStyle = "rgba(255,255,255,0.25)";
-    ctx.beginPath();
-    ctx.moveTo(0, gy);
-    ctx.lineTo(W, gy);
-    ctx.stroke();
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.fillText(`${z}m`, cxBEV + 4, gy - 3);
-  }
-
-  if (!frame || !videoW || !videoH) return;
-
-
-  // ── Lane lines (skeleton polyline + world-space extrapolation) ──
-  const BEV_EXTEND_Z = 20; // metres to extrapolate in world space
-  if (frame.lane_lines && frame.lane_lines.length > 0) {
-    function strokeBEVPts(pts: [number, number][]) {
-      if (pts.length < 2) return;
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0], pts[0][1]);
-      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-      ctx.stroke();
-    }
-
-    for (const line of frame.lane_lines) {
-      const pts = line;
-      if (!pts || pts.length < 2) continue;
-
-      // Project points to world space
-      const worldPts = pts
-        .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
-        .filter(Boolean) as { X: number; Z: number }[];
-      if (worldPts.length < 2) continue;
-
-      // Solid segment
-      ctx.strokeStyle = "#FFD700";
-      ctx.lineWidth = 2;
-      ctx.lineJoin = "round";
-      ctx.setLineDash([]);
-      strokeBEVPts(worldPts.map(w => worldToBEV(w.X, w.Z)));
-
-      // Dotted extensions using local direction at endpoints
-      const sorted = [...worldPts].sort((a, b) => a.Z - b.Z);
-      const N_LOCAL = Math.min(5, Math.floor(sorted.length / 2));
-
-      ctx.setLineDash([6, 4]);
-
-      // Extension towards horizon: last N_LOCAL points (far end)
-      if (N_LOCAL >= 2) {
-        const farPts = sorted.slice(-N_LOCAL);
-        const farFit = fitWorldQuadratic(farPts);
-        if (farFit) {
-          const maxZ = farPts[farPts.length - 1].Z;
-          const extPts: [number, number][] = [];
-          for (let i = 0; i <= 15; i++) {
-            const Z = maxZ + BEV_EXTEND_Z * i / 15;
-            extPts.push(worldToBEV(evalQuadratic(farFit, Z), Z));
-          }
-          strokeBEVPts(extPts);
-        }
-      }
-
-      // Extension towards car: first N_LOCAL points (near end)
-      if (N_LOCAL >= 2) {
-        const nearPts = sorted.slice(0, N_LOCAL);
-        const nearFit = fitWorldQuadratic(nearPts);
-        if (nearFit) {
-          const minZ = nearPts[0].Z;
-          const extNearZ = Math.max(0.5, minZ - BEV_EXTEND_Z);
-          if (extNearZ < minZ) {
-            const extPts: [number, number][] = [];
-            for (let i = 0; i <= 15; i++) {
-              const Z = extNearZ + (minZ - extNearZ) * i / 15;
-              extPts.push(worldToBEV(evalQuadratic(nearFit, Z), Z));
-            }
-            strokeBEVPts(extPts);
-          }
-        }
-      }
-      ctx.setLineDash([]);
-    }
-  }
-
-  // ── Vehicles ──
-  for (const det of frame.detections) {
-    const u = (det.x1 + det.x2) / 2;  // horizontal centre
-    const v = det.y2;                  // bottom edge = ground contact
-    const world = imageToWorld(u, v, videoW, videoH, params);
-    if (!world) continue;
-    const [bx, by] = worldToBEV(world.X, world.Z);
-    if (bx < -10 || bx > W + 10 || by < -10 || by > H + 10) continue;
-    ctx.beginPath();
-    ctx.arc(bx, by, 8, 0, Math.PI * 2);
-    ctx.fillStyle = BOX_COLORS[det.track_id % BOX_COLORS.length];
-    ctx.fill();
-    ctx.strokeStyle = "#000";
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Schematic lanes BEV (equal-width parallel lanes, cars snapped to lane centre)
-// ---------------------------------------------------------------------------
-
-function drawLanesBEV(
-  bevCanvas: HTMLCanvasElement,
-  frame: FrameEntry | null,
-  params: CameraParams,
-  videoW: number,
-  videoH: number,
-) {
-  const ctx = bevCanvas.getContext("2d")!;
-  const W = bevCanvas.width;
-  const H = bevCanvas.height;
-  if (!W || !H) return;
-
-  const laneW = W / SCHEMA_N_LANES;
-
-  // Map lane index → canvas X centre.
-  // Positive lane index = left of ego → left side of canvas.
-  // col = SCHEMA_MAX_LANE - laneIdx  (flips the axis)
-  function laneCenterX(laneIdx: number): number {
-    const col = Math.max(0, Math.min(SCHEMA_N_LANES - 1, SCHEMA_MAX_LANE - laneIdx));
-    return (col + 0.5) * laneW;
-  }
-  function distToY(dist: number): number {
-    return H - dist * H / BEV_MAX_DIST;
-  }
-
-  // ── Background ──
-  ctx.fillStyle = "#464646";
-  ctx.fillRect(0, 0, W, H);
-
-  // ── Ego-lane highlight ──  (col for laneIdx=0 is SCHEMA_MAX_LANE)
-  ctx.fillStyle = "rgba(255,255,255,0.06)";
-  ctx.fillRect(SCHEMA_MAX_LANE * laneW, 0, laneW, H);
-
-  // ── Distance grid ──
-  ctx.lineWidth = 1;
-  ctx.font = "11px system-ui";
-  ctx.textAlign = "left";
-  const egoLabelX = laneCenterX(0) + 4;
-  for (let z = 5; z <= BEV_MAX_DIST; z += 5) {
-    const gy = distToY(z);
-    ctx.strokeStyle = "rgba(255,255,255,0.25)";
-    ctx.beginPath();
-    ctx.moveTo(0, gy);
-    ctx.lineTo(W, gy);
-    ctx.stroke();
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.fillText(`${z}m`, egoLabelX, gy - 3);
-  }
-
-  // ── Lane boundary lines ──
-  ctx.strokeStyle = "#FFD700";
-  ctx.lineWidth = 2;
-  for (let k = 0; k <= SCHEMA_N_LANES; k++) {
-    const x = k * laneW;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, H);
-    ctx.stroke();
-  }
-
-  // ── Ego vehicle marker ──
-  ctx.beginPath();
-  ctx.arc(laneCenterX(0), H - 12, 6, 0, Math.PI * 2);
-  ctx.fillStyle = "rgba(255,255,255,0.7)";
-  ctx.fill();
-
-  if (!frame || !videoW || !videoH) return;
-
-  // ── Compute lane assignments ──
-  const wLanes = getValidLaneFits(frame, videoW, videoH, params);
-  const lanes  = computeLanes(frame, wLanes, videoW, videoH, params);
-
-  // ── Draw vehicles ──
-  for (const [laneIdx, cars] of lanes) {
-    const x = laneCenterX(laneIdx);
-    for (const car of cars) {
-      const y = distToY(car.distance);
-      if (y < -10 || y > H + 10) continue;
-      ctx.beginPath();
-      ctx.arc(x, y, 8, 0, Math.PI * 2);
-      ctx.fillStyle = BOX_COLORS[car.track_id % BOX_COLORS.length];
-      ctx.fill();
-      ctx.strokeStyle = "#000";
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Subtitle component
 // ---------------------------------------------------------------------------
@@ -818,8 +398,6 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const bevCanvasRef = useRef<HTMLCanvasElement>(null);
-  const lanesBevCanvasRef = useRef<HTMLCanvasElement>(null);
   const isScrubbing = useRef(false);
   // Cache batch data: batchIndex → FrameEntry[]
   const batchCache = useRef<Record<number, FrameEntry[]>>({});
@@ -898,8 +476,6 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   // ── Canvas drawing ──────────────────────────────────────────────────────
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
-    const bevCanvas = bevCanvasRef.current;
-    const lanesBevCanvas = lanesBevCanvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
     // Sync canvas resolution to its CSS size
@@ -908,34 +484,14 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
       canvas.height = canvas.clientHeight;
     }
     drawOverlay(canvas, video, frameDataRef.current, cameraParams);
-    // Raw BEV
-    if (bevCanvas) {
-      if (bevCanvas.width !== bevCanvas.clientWidth || bevCanvas.height !== bevCanvas.clientHeight) {
-        bevCanvas.width = bevCanvas.clientWidth;
-        bevCanvas.height = bevCanvas.clientHeight;
-      }
-      drawBEV(bevCanvas, frameDataRef.current, cameraParams, video.videoWidth, video.videoHeight);
-    }
-    // Lanes BEV
-    if (lanesBevCanvas) {
-      if (lanesBevCanvas.width !== lanesBevCanvas.clientWidth || lanesBevCanvas.height !== lanesBevCanvas.clientHeight) {
-        lanesBevCanvas.width = lanesBevCanvas.clientWidth;
-        lanesBevCanvas.height = lanesBevCanvas.clientHeight;
-      }
-      drawLanesBEV(lanesBevCanvas, frameDataRef.current, cameraParams, video.videoWidth, video.videoHeight);
-    }
   }, [cameraParams]);
 
   // Redraw when any canvas is resized
   useEffect(() => {
     const canvas = canvasRef.current;
-    const bevCanvas = bevCanvasRef.current;
-    const lanesBevCanvas = lanesBevCanvasRef.current;
     if (!canvas) return;
     const ro = new ResizeObserver(redraw);
     ro.observe(canvas);
-    if (bevCanvas) ro.observe(bevCanvas);
-    if (lanesBevCanvas) ro.observe(lanesBevCanvas);
     return () => ro.disconnect();
   }, [redraw]);
 
@@ -1124,89 +680,66 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
         {activeVideo ? (
           <>
             {/* Video + canvas overlay + BEV */}
-            <div style={{ flex: 1, background: "#1a1a1a", overflow: "hidden", display: "flex" }}>
-              {/* Video + detection overlay */}
-              <div style={{ flex: 1, position: "relative", minWidth: 0 }}>
-                <video
-                  key={activeVideo.filename}
-                  ref={videoRef}
-                  src={activeVideo.video_url}
-                  style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
-                  onPlay={() => { setIsPlaying(true); setDebugImgUrl(null); }}
-                  onPause={() => {
-                    setIsPlaying(false);
-                    const vid = videoRef.current;
-                    if (vid && import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
-                  }}
-                  onTimeUpdate={() => {
-                    const vid = videoRef.current;
-                    if (!vid) return;
-                    if (!isScrubbing.current) setCurrentTime(vid.currentTime);
+            <div style={{ flex: 1, background: "#1a1a1a", overflow: "hidden", position: "relative" }}>
+              <video
+                key={activeVideo.filename}
+                ref={videoRef}
+                src={activeVideo.video_url}
+                style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+                onPlay={() => { setIsPlaying(true); setDebugImgUrl(null); }}
+                onPause={() => {
+                  setIsPlaying(false);
+                  const vid = videoRef.current;
+                  if (vid && import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
+                }}
+                onTimeUpdate={() => {
+                  const vid = videoRef.current;
+                  if (!vid) return;
+                  if (!isScrubbing.current) setCurrentTime(vid.currentTime);
+                  loadFrameAndDraw(vid.currentTime);
+                }}
+                onSeeked={() => {
+                  const vid = videoRef.current;
+                  if (vid) {
                     loadFrameAndDraw(vid.currentTime);
-                  }}
-                  onSeeked={() => {
-                    const vid = videoRef.current;
-                    if (vid) {
-                      loadFrameAndDraw(vid.currentTime);
-                      if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
-                    }
-                    setDebugImgUrl(null);
-                  }}
-                  onLoadedMetadata={() => {
-                    const vid = videoRef.current;
-                    if (vid) {
-                      setDuration(vid.duration);
-                      const savedTime = import.meta.env.DEV ? parseFloat(localStorage.getItem("gd_currentTime") ?? "0") : 0;
-                      const t = Math.min(savedTime, vid.duration || 0);
-                      vid.currentTime = t;
-                      setCurrentTime(t);
-                      setIsPlaying(false);
-                      loadFrameAndDraw(t);
-                    }
-                  }}
-                />
-                {debugImgUrl && (
-                  <img
-                    src={debugImgUrl}
-                    style={{
-                      position: "absolute",
-                      top: 0, left: 0,
-                      width: "100%", height: "100%",
-                      objectFit: "contain",
-                      pointerEvents: "none",
-                    }}
-                  />
-                )}
-                <canvas
-                  ref={canvasRef}
+                    if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
+                  }
+                  setDebugImgUrl(null);
+                }}
+                onLoadedMetadata={() => {
+                  const vid = videoRef.current;
+                  if (vid) {
+                    setDuration(vid.duration);
+                    const savedTime = import.meta.env.DEV ? parseFloat(localStorage.getItem("gd_currentTime") ?? "0") : 0;
+                    const t = Math.min(savedTime, vid.duration || 0);
+                    vid.currentTime = t;
+                    setCurrentTime(t);
+                    setIsPlaying(false);
+                    loadFrameAndDraw(t);
+                  }
+                }}
+              />
+              {debugImgUrl && (
+                <img
+                  src={debugImgUrl}
                   style={{
                     position: "absolute",
                     top: 0, left: 0,
                     width: "100%", height: "100%",
+                    objectFit: "contain",
                     pointerEvents: "none",
                   }}
                 />
-              </div>
-              {/* Bird's Eye View (schematic lanes) */}
-              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #fff", display: "flex", flexDirection: "column" }}>
-                <div style={{ background: "#2a2a2a", color: "#fff", textAlign: "center", fontSize: "0.75rem", fontFamily: "system-ui", padding: "3px 0", flexShrink: 0, letterSpacing: "0.05em" }}>
-                  processed
-                </div>
-                <canvas
-                  ref={lanesBevCanvasRef}
-                  style={{ width: "100%", flex: 1, display: "block" }}
-                />
-              </div>
-              {/* Bird's Eye View (raw) */}
-              <div style={{ width: "220px", flexShrink: 0, borderLeft: "3px solid #fff", display: "flex", flexDirection: "column" }}>
-                <div style={{ background: "#2a2a2a", color: "#fff", textAlign: "center", fontSize: "0.75rem", fontFamily: "system-ui", padding: "3px 0", flexShrink: 0, letterSpacing: "0.05em" }}>
-                  original
-                </div>
-                <canvas
-                  ref={bevCanvasRef}
-                  style={{ width: "100%", flex: 1, display: "block" }}
-                />
-              </div>
+              )}
+              <canvas
+                ref={canvasRef}
+                style={{
+                  position: "absolute",
+                  top: 0, left: 0,
+                  width: "100%", height: "100%",
+                  pointerEvents: "none",
+                }}
+              />
             </div>
 
             {/* Controls */}
@@ -1255,23 +788,6 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   style={btnStyle}
                 >
                   Debug
-                </button>
-                <button
-                  onClick={async () => {
-                    if (!activeVideo) return;
-                    const frameN = Math.floor(currentTime * fps);
-                    const res = await fetch(
-                      `/api/footage/process-frame?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`,
-                    );
-                    if (!res.ok) return;
-                    const data: FrameEntry = await res.json();
-                    frameDataRef.current = data;
-                    setDebugImgUrl(null);
-                    redraw();
-                  }}
-                  style={btnStyle}
-                >
-                  Process
                 </button>
                 <span
                   style={{
