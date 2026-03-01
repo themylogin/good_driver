@@ -291,26 +291,16 @@ def _infer_frame(
     # ── Lane lines ──
     # outputs[1] is the lane-line segmentation head when len(outputs) >= 5
     lane_lines: list = []
-    lane_fits: list = []
     if len(outputs) >= 5 and outputs[1] is not None:
         try:
             lane_dicts = _mask_to_lane_lines(outputs[1], orig_w, orig_h)
             lane_lines = [ld["points"] for ld in lane_dicts]
-            lane_fits = [
-                {
-                    "points": ld["points"],
-                    "v_min": ld["v_min"],
-                    "v_max": ld["v_max"],
-                }
-                for ld in lane_dicts
-            ]
         except Exception as e:
             logger.warning("Lane vectorization failed: %s", e)
 
     return {
         "detections": detections,
         "lane_lines": lane_lines,
-        "lane_fits": lane_fits,
     }
 
 

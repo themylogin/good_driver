@@ -11,17 +11,10 @@ interface Detection {
   confidence: number;
 }
 
-interface LaneFit {
-  points: number[][];   // [[u,v], ...] RDP-simplified skeleton polyline
-  v_min: number;
-  v_max: number;
-}
-
 interface FrameEntry {
   frame: number;
   detections: Detection[];
   lane_lines: number[][][];           // [line][[x,y],...]
-  lane_fits?: LaneFit[];              // cubic fits (parallel to lane_lines)
 }
 
 type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
@@ -179,9 +172,9 @@ function drawOverlay(
 
   // ── Lane lines (skeleton polyline + world-space extrapolation) ──
   const EXTEND_Z = 20; // metres to extrapolate in world space
-  if (frame.lane_fits && frame.lane_fits.length > 0) {
-    for (const fit of frame.lane_fits) {
-      const pts = fit.points;
+  if (frame.lane_lines && frame.lane_lines.length > 0) {
+    for (const line of frame.lane_lines) {
+      const pts = line;
       if (!pts || pts.length < 2) continue;
 
       // Solid segment: draw skeleton polyline
@@ -255,20 +248,6 @@ function drawOverlay(
         }
       }
       ctx.setLineDash([]);
-    }
-  } else {
-    // Fallback: draw source points (no fits available)
-    ctx.strokeStyle = "#FFD700";
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    for (const line of frame.lane_lines) {
-      if (line.length < 2) continue;
-      ctx.beginPath();
-      ctx.moveTo(line[0][0] * scale + offsetX, line[0][1] * scale + offsetY);
-      for (let i = 1; i < line.length; i++) {
-        ctx.lineTo(line[i][0] * scale + offsetX, line[i][1] * scale + offsetY);
-      }
-      ctx.stroke();
     }
   }
 
@@ -363,9 +342,9 @@ function evalQuadratic(coeffs: [number, number, number], Z: number): number {
   return coeffs[0] * Z * Z + coeffs[1] * Z + coeffs[2];
 }
 
-/** A lane fit projected to world space: sorted (X, Z) pairs for interpolation. */
+/** A lane line projected to world space: sorted (X, Z) pairs for interpolation. */
 interface WorldLane {
-  fit: LaneFit;
+  points: number[][];
   worldPts: { X: number; Z: number }[];  // sorted by Z ascending
 }
 
@@ -404,25 +383,25 @@ function evalWorldLaneX(wl: WorldLane, Z: number): number | null {
 }
 
 /**
- * Build world-space lane representations from lane fits.
+ * Build world-space lane representations from lane lines.
  * Projects each lane's points to world space and sorts by Z.
  */
 function buildWorldLanes(
-  fits: LaneFit[],
+  lines: number[][][],
   videoW: number, videoH: number,
   params: CameraParams,
 ): WorldLane[] {
-  return fits.map(fit => {
-    const worldPts = fit.points
+  return lines.map(line => {
+    const worldPts = line
       .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
       .filter(Boolean) as { X: number; Z: number }[];
     worldPts.sort((a, b) => a.Z - b.Z);
-    return { fit, worldPts };
+    return { points: line, worldPts };
   }).filter(wl => wl.worldPts.length >= 2);
 }
 
 /**
- * Get usable lane fits from a frame, deduped and sorted left-to-right.
+ * Get usable lane lines from a frame, deduped and sorted left-to-right.
  * Uses world-space X position at a near-car Z to determine ordering.
  */
 function getValidLaneFits(
@@ -430,10 +409,10 @@ function getValidLaneFits(
   videoW: number, videoH: number,
   params: CameraParams,
 ): WorldLane[] {
-  const fits = frame.lane_fits;
-  if (!fits || fits.length === 0) return [];
+  const lines = frame.lane_lines;
+  if (!lines || lines.length === 0) return [];
 
-  const wLanes = buildWorldLanes(fits, videoW, videoH, params);
+  const wLanes = buildWorldLanes(lines, videoW, videoH, params);
   if (wLanes.length === 0) return [];
 
   // Reference Z: the smallest max-Z across all lanes (closest common depth)
@@ -584,7 +563,7 @@ function drawBEV(
 
   // ── Lane lines (skeleton polyline + world-space extrapolation) ──
   const BEV_EXTEND_Z = 20; // metres to extrapolate in world space
-  if (frame.lane_fits && frame.lane_fits.length > 0) {
+  if (frame.lane_lines && frame.lane_lines.length > 0) {
     function strokeBEVPts(pts: [number, number][]) {
       if (pts.length < 2) return;
       ctx.beginPath();
@@ -593,8 +572,8 @@ function drawBEV(
       ctx.stroke();
     }
 
-    for (const fit of frame.lane_fits) {
-      const pts = fit.points;
+    for (const line of frame.lane_lines) {
+      const pts = line;
       if (!pts || pts.length < 2) continue;
 
       // Project points to world space
@@ -649,24 +628,6 @@ function drawBEV(
         }
       }
       ctx.setLineDash([]);
-    }
-  } else {
-    ctx.strokeStyle = "#FFD700";
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    for (const line of frame.lane_lines) {
-      const pts = line
-        .map(([u, v]) => imageToWorld(u, v, videoW, videoH, params))
-        .filter(Boolean) as { X: number; Z: number }[];
-      if (pts.length < 2) continue;
-      ctx.beginPath();
-      const [bx0, by0] = worldToBEV(pts[0].X, pts[0].Z);
-      ctx.moveTo(bx0, by0);
-      for (let i = 1; i < pts.length; i++) {
-        const [bx, by] = worldToBEV(pts[i].X, pts[i].Z);
-        ctx.lineTo(bx, by);
-      }
-      ctx.stroke();
     }
   }
 
