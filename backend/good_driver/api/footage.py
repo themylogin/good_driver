@@ -94,7 +94,8 @@ _LANE_THRESHOLD = 0.5
 _DRIVABLE_THRESHOLD = 0.5
 
 
-_SKEL_BORDER  = 5    # discard skeleton pixels within this margin of image edges
+_SKEL_BORDER       = 5    # discard skeleton pixels within this margin of image edges
+_JUNCTION_DILATE_K = 7    # kernel size for erasing skeleton around junctions (larger = split earlier)
 _RDP_EPSILON = 1.5  # Ramer-Douglas-Peucker tolerance in model-space pixels
 
 
@@ -123,7 +124,7 @@ def _vectorize_component(
     neighbor_count = cv2.filter2D(skeleton, -1, np.ones((3, 3), dtype=np.uint8)) * skeleton
     junctions = (neighbor_count > 3).astype(np.uint8)
     skel_split = skeleton.copy()
-    skel_split[cv2.dilate(junctions, np.ones((3, 3), dtype=np.uint8)) > 0] = 0
+    skel_split[cv2.dilate(junctions, np.ones((_JUNCTION_DILATE_K, _JUNCTION_DILATE_K), dtype=np.uint8)) > 0] = 0
 
     n_branches, branch_labels = cv2.connectedComponents(skel_split, connectivity=8)
 
