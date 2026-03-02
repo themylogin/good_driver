@@ -42,7 +42,16 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 _executor = ThreadPoolExecutor(max_workers=1)
 _processing_videos: set[str] = set()   # "directory|filename" keys currently queued or running
-_live_progress: dict[str, int] = {}    # key → current frame_n (updated every frame)
+_live_progress: dict[str, dict] = {}   # key → {"step": name, "processed_frames": N}
+
+# ---------------------------------------------------------------------------
+# Processing steps — ordered pipeline
+# ---------------------------------------------------------------------------
+
+PROCESSING_STEPS = [
+    {"name": "inference", "label": "Inference"},
+    {"name": "lead", "label": "Lead car"},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -72,18 +81,53 @@ def _read_metadata(data_dir: Path) -> dict | None:
     p = data_dir / "metadata.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text())
+    meta = json.loads(p.read_text())
+    # Backward compat: migrate top-level processed_frames → steps.inference
+    if "processed_frames" in meta:
+        steps = meta.setdefault("steps", {})
+        if "inference" not in steps:
+            steps["inference"] = {"processed_frames": meta["processed_frames"]}
+        del meta["processed_frames"]
+    return meta
 
 
-def _write_metadata(data_dir: Path, total: int, processed: int, **extra) -> None:
-    """Write metadata, preserving any existing extra fields unless overridden by **extra."""
+def _write_step_metadata(data_dir: Path, step_name: str, processed: int, **top_level_extra) -> None:
+    """Update a specific step's processed_frames in metadata."""
     meta_path = data_dir / "metadata.json"
     meta: dict = {}
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
-    meta.update({"total_frames": total, "processed_frames": processed})
-    meta.update(extra)
+    meta.update(top_level_extra)
+    steps = meta.setdefault("steps", {})
+    step = steps.setdefault(step_name, {})
+    step["processed_frames"] = processed
     meta_path.write_text(json.dumps(meta))
+
+
+def _is_step_complete(directory: str, filename: str, step_name: str) -> bool:
+    ddir = _data_dir(Path(directory), filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        return False
+    total = meta.get("total_frames", 0)
+    if total == 0:
+        return False
+    steps = meta.get("steps", {})
+    step_info = steps.get(step_name, {})
+    return step_info.get("processed_frames", 0) >= total
+
+
+def _all_steps_complete(meta: dict | None) -> bool:
+    if meta is None:
+        return False
+    total = meta.get("total_frames", 0)
+    if total == 0:
+        return False
+    steps = meta.get("steps", {})
+    return all(
+        steps.get(s["name"], {}).get("processed_frames", 0) >= total
+        for s in PROCESSING_STEPS
+    )
 
 
 
@@ -410,76 +454,166 @@ def _infer_frame(
 # Background processing worker
 # ---------------------------------------------------------------------------
 
-def _process_video_worker(filename: str, directory: str, key: str) -> None:
-    """Process all frames of a video and write frame-data JSON files."""
-    try:
-        data_dir = Path(directory)
-        path = data_dir / filename
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            logger.error("Cannot open video: %s", path)
-            return
+def _run_inference_step(filename: str, directory: str, key: str) -> None:
+    """Step 1: Run YOLO inference + tracking on every frame."""
+    data_dir = Path(directory)
+    path = data_dir / filename
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        logger.error("Cannot open video: %s", path)
+        return
 
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        ddir = _data_dir(data_dir, filename)
-        ddir.mkdir(exist_ok=True)
+    ddir = _data_dir(data_dir, filename)
+    ddir.mkdir(exist_ok=True)
 
-        # Resume from last completed batch boundary
-        meta = _read_metadata(ddir)
-        resume_frame = 0
-        if meta is not None:
-            # Round down to nearest batch of 100 to resume cleanly
-            resume_frame = (meta["processed_frames"] // 100) * 100
-        _write_metadata(ddir, total, resume_frame,
-                        fps=cap.get(cv2.CAP_PROP_FPS),
-                        width=orig_w, height=orig_h)
+    # Resume from last completed batch boundary
+    meta = _read_metadata(ddir)
+    resume_frame = 0
+    if meta is not None:
+        inf_processed = meta.get("steps", {}).get("inference", {}).get("processed_frames", 0)
+        resume_frame = (inf_processed // 100) * 100
+    _write_step_metadata(ddir, "inference", resume_frame,
+                         total_frames=total,
+                         fps=cap.get(cv2.CAP_PROP_FPS),
+                         width=orig_w, height=orig_h)
 
-        # Seek to resume position
-        if resume_frame > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
-            logger.info("Resuming %s from frame %d/%d", filename, resume_frame, total)
+    # Seek to resume position
+    if resume_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, resume_frame)
+        logger.info("Resuming inference %s from frame %d/%d", filename, resume_frame, total)
 
-        session = _get_session()
-        tracker = ByteTracker()
+    session = _get_session()
+    tracker = ByteTracker()
 
-        batch: list[dict] = []
-        frame_n = resume_frame
+    batch: list[dict] = []
+    frame_n = resume_frame
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
 
-            result = _infer_frame(frame, orig_w, orig_h, session)
-            result["detections"] = tracker.update(result["detections"])
-            result["frame"] = frame_n
-            batch.append(result)
+        result = _infer_frame(frame, orig_w, orig_h, session)
+        result["detections"] = tracker.update(result["detections"])
+        result["frame"] = frame_n
+        batch.append(result)
 
-            if len(batch) == 100:
-                first_frame = frame_n - 99
-                fpath = _frame_file_path(ddir, first_frame)
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
-                _write_metadata(ddir, total, frame_n + 1)
-                batch = []
-
-            _live_progress[key] = frame_n + 1
-            frame_n += 1
-
-        # Flush remainder (< 100 frames)
-        if batch:
-            first_frame = frame_n - len(batch)
+        if len(batch) == 100:
+            first_frame = frame_n - 99
             fpath = _frame_file_path(ddir, first_frame)
             fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(json.dumps(batch))
+            fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
+            _write_step_metadata(ddir, "inference", frame_n + 1)
+            batch = []
 
-        _write_metadata(ddir, total, frame_n)
-        cap.release()
-        logger.info("Finished processing %s (%d frames)", filename, frame_n)
+        _live_progress[key] = {"step": "inference", "processed_frames": frame_n + 1}
+        frame_n += 1
 
+    # Flush remainder (< 100 frames)
+    if batch:
+        first_frame = frame_n - len(batch)
+        fpath = _frame_file_path(ddir, first_frame)
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(json.dumps(batch))
+
+    _write_step_metadata(ddir, "inference", frame_n)
+    cap.release()
+    logger.info("Finished inference for %s (%d frames)", filename, frame_n)
+
+
+def _run_lead_step(filename: str, directory: str, key: str) -> None:
+    """Step 2: Compute lead car (tracker_id + hwc distance) for every frame."""
+    data_dir = Path(directory)
+    ddir = _data_dir(data_dir, filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        logger.error("No metadata for %s, skipping lead step", filename)
+        return
+
+    total = meta.get("total_frames", 0)
+    orig_w = meta.get("width", _INPUT_W)
+    orig_h = meta.get("height", _INPUT_H)
+    cam = _load_camera_params(data_dir)
+
+    result: list[dict | None] = []
+    frame_n = 0
+
+    while frame_n < total:
+        # Load batch
+        batch_start = (frame_n // 100) * 100
+        fpath = _frame_file_path(ddir, batch_start)
+        if not fpath.exists():
+            # Batch not available — fill with nulls
+            batch_end = min(batch_start + 100, total)
+            result.extend([None] * (batch_end - frame_n))
+            frame_n = batch_end
+            continue
+
+        raw = fpath.read_bytes()
+        frames = json.loads(gzip.decompress(raw) if fpath.suffix == ".gz" else raw)
+
+        # Process each frame in the batch
+        offset = frame_n - batch_start
+        for i in range(offset, len(frames)):
+            frame_entry = frames[i]
+            lead_entry: dict | None = None
+
+            mask_payload = frame_entry.get("mask")
+            detections = frame_entry.get("detections", [])
+
+            if mask_payload is not None and cam is not None:
+                classes_region = decode_mask(mask_payload)
+                classes_full = np.zeros((_INPUT_H, _INPUT_W), dtype=np.uint8)
+                start_row = mask_payload["start_row"]
+                classes_full[start_row:start_row + mask_payload["row_count"]] = classes_region
+
+                da_mask = ((classes_full == DRIVEABLE) | (classes_full == LANE_ON_DRIVEABLE)).astype(np.uint8)
+                lane_mask = ((classes_full == LANE_ON_DRIVEABLE) | (classes_full == LANE_NO_DRIVEABLE)).astype(np.uint8)
+
+                lane_masks, ego_idx, _ego_discarded = _build_lane_polygons(
+                    da_mask, lane_mask, orig_w, orig_h)
+
+                centerline_img, centerline_extrap, _raw_cl, lead_det = _fit_centerline_and_lead(
+                    lane_masks, ego_idx, detections, orig_w, orig_h, cam)
+
+                if lead_det is not None:
+                    hwc_result = _compute_hwc_distance(
+                        lead_det, centerline_img, centerline_extrap, orig_w, cam)
+                    if hwc_result is not None:
+                        hwc_dist, _theta = hwc_result
+                        lead_entry = {"id": lead_det["track_id"], "distance": round(hwc_dist, 1)}
+
+            result.append(lead_entry)
+            frame_n += 1
+
+            _live_progress[key] = {"step": "lead", "processed_frames": frame_n}
+            if frame_n % 1000 == 0:
+                _write_step_metadata(ddir, "lead", frame_n)
+
+    # Write result atomically
+    out_path = ddir / "lead.json.gz"
+    tmp_path = ddir / "lead.json.gz.tmp"
+    tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
+    tmp_path.rename(out_path)
+
+    _write_step_metadata(ddir, "lead", frame_n)
+    logger.info("Finished lead step for %s (%d frames)", filename, frame_n)
+
+
+def _process_video_worker(filename: str, directory: str, key: str) -> None:
+    """Run all processing steps sequentially for one video."""
+    try:
+        for step in PROCESSING_STEPS:
+            if _is_step_complete(directory, filename, step["name"]):
+                continue
+            if step["name"] == "inference":
+                _run_inference_step(filename, directory, key)
+            elif step["name"] == "lead":
+                _run_lead_step(filename, directory, key)
     except Exception:
         logger.exception("Error processing video %s", filename)
     finally:
@@ -531,12 +665,19 @@ async def get_metadata(filename: str, directory: str):
     ddir = _data_dir(Path(directory), filename)
     meta = _read_metadata(ddir)
     if meta is None:
-        return {"total_frames": 0, "processed_frames": 0}
-    # Overlay live frame counter for more granular progress
+        return {"total_frames": 0, "steps": {}}
+    # Overlay live progress into the correct step
     key = f"{directory}|{filename}"
     live = _live_progress.get(key)
-    if live is not None and live > meta.get("processed_frames", 0):
-        meta = {**meta, "processed_frames": live}
+    current_step = None
+    if live is not None:
+        step_name = live["step"]
+        current_step = step_name
+        steps = meta.setdefault("steps", {})
+        step_info = steps.setdefault(step_name, {})
+        if live["processed_frames"] > step_info.get("processed_frames", 0):
+            step_info["processed_frames"] = live["processed_frames"]
+    meta["current_step"] = current_step
     meta["processing"] = key in _processing_videos
     return meta
 
@@ -752,6 +893,49 @@ def _fit_centerline_and_lead(
     return centerline_img, centerline_extrap, raw_centerline_img, lead_det
 
 
+def _compute_hwc_distance(
+    lead_det: dict,
+    centerline_img: list[tuple[int, int]],
+    centerline_extrap: list[tuple[int, int]],
+    orig_w: int,
+    cam: dict,
+) -> tuple[float, float] | None:
+    """Compute angle-corrected apparent-width distance to a lead car.
+
+    Returns (hwc_distance, theta_degrees), or None if it can't be computed.
+    """
+    fx_scaled = cam["fx"] * (orig_w / cam["image_width"])
+    bbox_w_px = lead_det["x2"] - lead_det["x1"]
+    if bbox_w_px <= 0:
+        return None
+    hw_dist = 2.0 * fx_scaled / bbox_w_px
+
+    all_cl = [*centerline_img, *centerline_extrap]
+    entry_idx = None
+    for ci, (cpx, cpy) in enumerate(all_cl):
+        if (lead_det["x1"] <= cpx <= lead_det["x2"]
+                and lead_det["y1"] <= cpy <= lead_det["y2"]):
+            entry_idx = ci
+            break
+    if entry_idx is None or len(all_cl) < 2:
+        return None
+
+    lo = max(0, entry_idx - 5)
+    hi = min(len(all_cl), entry_idx + 6)
+    if hi - lo < 2:
+        return None
+
+    seg = np.array(all_cl[lo:hi], dtype=np.float64)
+    dx = seg[-1, 0] - seg[0, 0]
+    dy = seg[-1, 1] - seg[0, 1]
+    theta_deg = math.degrees(math.atan2(abs(dy), abs(dx)))
+    f_theta = float(np.interp(
+        theta_deg, [0, 13, 24, 40, 90], [0.60, 0.73, 0.86, 0.91, 1.0]
+    ))
+    f_theta = max(0.01, f_theta)
+    return hw_dist / f_theta, theta_deg
+
+
 def _draw_overlays(
     canvas: np.ndarray,
     lane_masks: list[np.ndarray],
@@ -822,33 +1006,10 @@ def _draw_overlays(
                 hw_dist = 2.0 * fx_scaled / bbox_w_px
                 lines.append(f"hw: {hw_dist:.0f}m")
 
-                # hwc: angle-corrected width distance
-                # f(θ) = fraction of bbox that is car width (empirical linear fit)
-                # f(90°) = 1.0, f(13°) = 0.73  →  hwc = hw / f(θ)
-                all_cl = [*centerline_img, *centerline_extrap]
-                entry_idx = None
-                for _ci, (cpx, cpy) in enumerate(all_cl):
-                    if (lead_det["x1"] <= cpx <= lead_det["x2"]
-                            and lead_det["y1"] <= cpy <= lead_det["y2"]):
-                        entry_idx = _ci
-                        break
-                if entry_idx is not None and len(all_cl) >= 2:
-                    lo = max(0, entry_idx - 5)
-                    hi = min(len(all_cl), entry_idx + 6)
-                    if hi - lo >= 2:
-                        seg = np.array(all_cl[lo:hi], dtype=np.float64)
-                        dx = seg[-1, 0] - seg[0, 0]
-                        dy = seg[-1, 1] - seg[0, 1]
-                        theta_deg = math.degrees(
-                            math.atan2(abs(dy), abs(dx)))
-                        f_theta = float(np.interp(
-                            theta_deg,
-                            [0, 13, 24, 40, 90],
-                            [0.60, 0.73, 0.86, 0.91, 1.0],
-                        ))
-                        f_theta = max(0.01, f_theta)
-                        hwc_dist = hw_dist / f_theta
-                        hwc_label = f"a: {theta_deg:.0f} hwc: {hwc_dist:.0f}m"
+                hwc_result = _compute_hwc_distance(lead_det, centerline_img, centerline_extrap, orig_w, cam)
+                if hwc_result is not None:
+                    hwc_dist, theta_deg = hwc_result
+                    hwc_label = f"a: {theta_deg:.0f} hwc: {hwc_dist:.0f}m"
 
             if lines or hwc_label:
                 bbox_cx = lead_det["x1"] + (lead_det["x2"] - lead_det["x1"]) // 2
@@ -1102,7 +1263,7 @@ async def start_processing(directory: str):
 
         ddir = _data_dir(data_dir, filename)
         meta = _read_metadata(ddir)
-        if meta is not None and meta["processed_frames"] >= meta["total_frames"] > 0:
+        if _all_steps_complete(meta):
             continue  # already complete
 
         _processing_videos.add(key)

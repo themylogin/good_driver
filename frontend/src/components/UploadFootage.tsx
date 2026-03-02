@@ -5,7 +5,17 @@ import type { CameraParams } from "../App";
 // Types
 // ---------------------------------------------------------------------------
 
-type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
+interface StepProgress {
+  processed_frames: number;
+}
+
+type VideoMeta = {
+  total_frames: number;
+  fps?: number;
+  steps?: Record<string, StepProgress>;
+  current_step?: string | null;
+  processing?: boolean;
+} | null;
 
 
 // ---------------------------------------------------------------------------
@@ -13,6 +23,9 @@ type VideoMeta = { total_frames: number; processed_frames: number; fps?: number;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_FPS = 30;
+
+const STEP_LABELS: Record<string, string> = { inference: "Inference", lead: "Lead car" };
+const STEP_ORDER = ["inference", "lead"];
 
 
 const btnStyle: React.CSSProperties = {
@@ -46,6 +59,7 @@ function formatTime(t: number): string {
 interface ProgressSnapshot {
   frames: number;
   time: number;
+  step: string;
 }
 
 function formatEta(seconds: number): string {
@@ -58,22 +72,38 @@ function formatEta(seconds: number): string {
   return `${h}h ${m % 60}m`;
 }
 
+function isAllStepsComplete(meta: VideoMeta): boolean {
+  if (!meta || meta.total_frames <= 0 || !meta.steps) return false;
+  return STEP_ORDER.every((step) => {
+    const s = meta.steps?.[step];
+    return s && s.processed_frames >= meta.total_frames;
+  });
+}
+
 function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta: VideoMeta; progressRef: React.RefObject<Record<string, ProgressSnapshot>> }) {
   if (!meta || meta.total_frames === 0) {
     return <div style={{ color: "#aaa", fontSize: "0.78rem" }}>Not processed</div>;
   }
-  if (meta.processed_frames >= meta.total_frames) {
+  if (isAllStepsComplete(meta)) {
     return <div style={{ color: "#4a0", fontSize: "0.78rem" }}>Processing complete</div>;
   }
-  const pct = Math.round((meta.processed_frames / meta.total_frames) * 100);
 
-  // Compute ETA from first observation of progress
+  // Find the current step being processed
+  const currentStep = meta.current_step
+    ?? STEP_ORDER.find((s) => (meta.steps?.[s]?.processed_frames ?? 0) < meta.total_frames)
+    ?? STEP_ORDER[0];
+  const stepIdx = STEP_ORDER.indexOf(currentStep);
+  const stepLabel = STEP_LABELS[currentStep] ?? currentStep;
+  const processed = meta.steps?.[currentStep]?.processed_frames ?? 0;
+  const pct = Math.round((processed / meta.total_frames) * 100);
+
+  // Compute ETA from first observation of progress for current step
   let etaStr = "";
   const snap = progressRef.current?.[filename];
-  if (snap && meta.processed_frames > snap.frames) {
+  if (snap && snap.step === currentStep && processed > snap.frames) {
     const elapsed = (Date.now() - snap.time) / 1000;
-    const done = meta.processed_frames - snap.frames;
-    const remaining = meta.total_frames - meta.processed_frames;
+    const done = processed - snap.frames;
+    const remaining = meta.total_frames - processed;
     const rate = done / elapsed;
     if (rate > 0) {
       etaStr = `ETA ${formatEta(remaining / rate)}`;
@@ -82,7 +112,7 @@ function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta
 
   return (
     <div style={{ color: "#888", fontSize: "0.78rem" }}>
-      {meta.processed_frames}/{meta.total_frames} frames ({pct}%){etaStr && `, ${etaStr}`}
+      Step {stepIdx + 1}/{STEP_ORDER.length}: {stepLabel} {processed}/{meta.total_frames} ({pct}%){etaStr && `, ${etaStr}`}
     </div>
   );
 }
@@ -134,10 +164,13 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     const now = Date.now();
     let anyProcessing = false;
     for (const [fname, m] of Object.entries(metaMap) as [string, VideoMeta][]) {
-      if (m?.processing) {
+      if (m?.processing && m.current_step) {
         anyProcessing = true;
-        if (!progressSnapshots.current[fname]) {
-          progressSnapshots.current[fname] = { frames: m.processed_frames, time: now };
+        const snap = progressSnapshots.current[fname];
+        const currentFrames = m.steps?.[m.current_step]?.processed_frames ?? 0;
+        // Reset snapshot if step changed or no snapshot yet
+        if (!snap || snap.step !== m.current_step) {
+          progressSnapshots.current[fname] = { frames: currentFrames, time: now, step: m.current_step };
         }
       }
     }
@@ -160,21 +193,23 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
       .catch((e) => setErrorMessage(String(e)));
   }, [directory, fetchAllMeta]);
 
-  // ── Set fps from metadata when a video is selected ─────────────────────
+  // ── Clear overlay when active video changes ─────────────────────────────
   useEffect(() => {
     if (!activeVideo) return;
     if (import.meta.env.DEV) localStorage.setItem("gd_activeVideo", activeVideo.filename);
-    const meta = metas[activeVideo.filename];
-    if (meta?.fps) setFps(meta.fps);
     setOverlayUrl(null);
     setDebugImgUrl(null);
+  }, [activeVideo]);
+
+  // ── Set fps from metadata ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!activeVideo) return;
+    const meta = metas[activeVideo.filename];
+    if (meta?.fps) setFps(meta.fps);
   }, [activeVideo, metas]);
 
   // ── Poll metadata while processing is active ────────────────────────────
-  const allComplete = videos.length > 0 && videos.every((v) => {
-    const m = metas[v.filename];
-    return m !== null && m !== undefined && m.total_frames > 0 && m.processed_frames >= m.total_frames;
-  });
+  const allComplete = videos.length > 0 && videos.every((v) => isAllStepsComplete(metas[v.filename]));
   // Clear the flag only when everything finishes
   useEffect(() => {
     if (allComplete) setProcessingStarted(false);
@@ -190,7 +225,8 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     if (!activeVideo) { setOverlayUrl(null); return; }
     const meta = metas[activeVideo.filename];
     const frameN = Math.floor(time * fps);
-    if (!meta || meta.processed_frames <= frameN) {
+    const inferenceFrames = meta?.steps?.inference?.processed_frames ?? 0;
+    if (!meta || inferenceFrames <= frameN) {
       setOverlayUrl(null);
       return;
     }
@@ -250,8 +286,11 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     const now = Date.now();
     for (const v of videos) {
       const m = metas[v.filename];
-      if (m && m.total_frames > 0 && m.processed_frames < m.total_frames) {
-        progressSnapshots.current[v.filename] = { frames: m.processed_frames, time: now };
+      if (m && m.total_frames > 0 && !isAllStepsComplete(m)) {
+        // Find first incomplete step
+        const step = STEP_ORDER.find((s) => (m.steps?.[s]?.processed_frames ?? 0) < m.total_frames) ?? STEP_ORDER[0];
+        const frames = m.steps?.[step]?.processed_frames ?? 0;
+        progressSnapshots.current[v.filename] = { frames, time: now, step };
       }
     }
     try {
