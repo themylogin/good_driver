@@ -518,7 +518,7 @@ def _run_inference_step(filename: str, directory: str, key: str) -> None:
         first_frame = frame_n - len(batch)
         fpath = _frame_file_path(ddir, first_frame)
         fpath.parent.mkdir(parents=True, exist_ok=True)
-        fpath.write_text(json.dumps(batch))
+        fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
 
     _write_step_metadata(ddir, "inference", frame_n)
     cap.release()
@@ -554,7 +554,11 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
             continue
 
         raw = fpath.read_bytes()
-        frames = json.loads(gzip.decompress(raw) if fpath.suffix == ".gz" else raw)
+        try:
+            data = gzip.decompress(raw) if fpath.suffix == ".gz" else raw
+        except gzip.BadGzipFile:
+            data = raw  # legacy uncompressed remainder
+        frames = json.loads(data)
 
         # Process each frame in the batch
         offset = frame_n - batch_start
@@ -1303,7 +1307,11 @@ async def get_overlay(filename: str, directory: str, frame: int):
         raise HTTPException(404, f"Batch not processed")
 
     raw = fpath.read_bytes()
-    frames = json.loads(gzip.decompress(raw) if fpath.suffix == ".gz" else raw)
+    try:
+        data = gzip.decompress(raw) if fpath.suffix == ".gz" else raw
+    except gzip.BadGzipFile:
+        data = raw  # legacy uncompressed remainder
+    frames = json.loads(data)
     frame_idx = frame % 100
     if frame_idx >= len(frames):
         raise HTTPException(404, f"Frame {frame} not found in batch")
