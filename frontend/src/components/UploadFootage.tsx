@@ -24,8 +24,8 @@ type VideoMeta = {
 
 const DEFAULT_FPS = 30;
 
-const STEP_LABELS: Record<string, string> = { inference: "Inference", lead: "Lead car" };
-const STEP_ORDER = ["inference", "lead"];
+const STEP_LABELS: Record<string, string> = { inference: "Inference", lead: "Lead car", distances: "Distances", gps: "GPS" };
+const STEP_ORDER = ["inference", "lead", "distances", "gps"];
 
 
 const btnStyle: React.CSSProperties = {
@@ -143,6 +143,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [overlayUrl, setOverlayUrl] = useState<string | null>(null);
   const [debugImgUrl, setDebugImgUrl] = useState<string | null>(null);
+  const [gpsInfo, setGpsInfo] = useState<{ gps: { lat: number; lon: number; datetime: string; speed_kmh: number } | null } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const isScrubbing = useRef(false);
@@ -199,6 +200,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     if (import.meta.env.DEV) localStorage.setItem("gd_activeVideo", activeVideo.filename);
     setOverlayUrl(null);
     setDebugImgUrl(null);
+    setGpsInfo(null);
   }, [activeVideo]);
 
   // ── Set fps from metadata ─────────────────────────────────────────────
@@ -233,6 +235,20 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     setOverlayUrl(
       `/api/footage/overlay?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`,
     );
+  }, [activeVideo, fps, directory, metas]);
+
+  // ── Fetch GPS info for the current frame ────────────────────────────────
+  const updateGpsInfo = useCallback((time: number) => {
+    if (!activeVideo) { setGpsInfo(null); return; }
+    const meta = metas[activeVideo.filename];
+    const gpsDone = meta && meta.total_frames > 0
+      && (meta.steps?.gps?.processed_frames ?? 0) >= meta.total_frames;
+    if (!gpsDone) { setGpsInfo(null); return; }
+    const frameN = Math.floor(time * fps);
+    fetch(`/api/footage/gps-info?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => setGpsInfo(data ?? null))
+      .catch(() => setGpsInfo(null));
   }, [activeVideo, fps, directory, metas]);
 
   // ── Lead timeline URLs (available when lead step is complete) ───────────
@@ -416,11 +432,13 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                   if (!vid) return;
                   if (!isScrubbing.current) setCurrentTime(vid.currentTime);
                   updateOverlay(vid.currentTime);
+                  updateGpsInfo(vid.currentTime);
                 }}
                 onSeeked={() => {
                   const vid = videoRef.current;
                   if (vid) {
                     updateOverlay(vid.currentTime);
+                    updateGpsInfo(vid.currentTime);
                     if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
                   }
                   setDebugImgUrl(null);
@@ -435,6 +453,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                     setCurrentTime(t);
                     setIsPlaying(false);
                     updateOverlay(t);
+                    updateGpsInfo(t);
                   }
                 }}
               />
@@ -542,6 +561,13 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                 >
                   {formatTime(currentTime)} / {formatTime(duration)}
                   {" | "}Frame: {Math.floor(currentTime * fps)}
+                  {gpsInfo?.gps && (
+                    <>
+                      {" | "}<a href={`https://www.google.com/maps?q=${gpsInfo.gps.lat},${gpsInfo.gps.lon}`} target="_blank" rel="noopener noreferrer">{gpsInfo.gps.lat.toFixed(5)}, {gpsInfo.gps.lon.toFixed(5)}</a>
+                      {" | "}{gpsInfo.gps.speed_kmh.toFixed(0)} km/h
+                      {" | "}{gpsInfo.gps.datetime}
+                    </>
+                  )}
                 </span>
                 <label
                   style={{

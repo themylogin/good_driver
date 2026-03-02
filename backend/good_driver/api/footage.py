@@ -28,6 +28,7 @@ from .calibrate import (
 )
 from ..segmentation_mask import encode_mask, decode_mask, DRIVEABLE, LANE_ON_DRIVEABLE, LANE_NO_DRIVEABLE
 from ..tracker import ByteTracker
+from ..novatek_gps import extract_gps
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ _live_progress: dict[str, dict] = {}   # key → {"step": name, "processed_frame
 PROCESSING_STEPS = [
     {"name": "inference", "label": "Inference"},
     {"name": "lead", "label": "Lead car"},
+    {"name": "distances", "label": "Distances"},
+    {"name": "gps", "label": "GPS"},
 ]
 
 
@@ -608,6 +611,71 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
     logger.info("Finished lead step for %s (%d frames)", filename, frame_n)
 
 
+def _run_distances_step(filename: str, directory: str, key: str) -> None:
+    """Step 3: Smooth lead data and write per-frame distances."""
+    data_dir = Path(directory)
+    ddir = _data_dir(data_dir, filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        logger.error("No metadata for %s, skipping distances step", filename)
+        return
+
+    total = meta.get("total_frames", 0)
+
+    lead_path = ddir / "lead.json.gz"
+    if not lead_path.exists():
+        logger.error("No lead.json.gz for %s, skipping distances step", filename)
+        return
+
+    raw_lead = json.loads(gzip.decompress(lead_path.read_bytes()))
+    smoothed = _smooth_lead_data(raw_lead)
+
+    result: list[dict | None] = []
+    for i, entry in enumerate(smoothed):
+        if entry is not None:
+            result.append({"tracker_id": entry["id"], "distance": entry["distance"]})
+        else:
+            result.append(None)
+        if (i + 1) % 1000 == 0:
+            _live_progress[key] = {"step": "distances", "processed_frames": i + 1}
+
+    out_path = ddir / "distances.json.gz"
+    tmp_path = ddir / "distances.json.gz.tmp"
+    tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
+    tmp_path.rename(out_path)
+
+    _write_step_metadata(ddir, "distances", total)
+    logger.info("Finished distances step for %s (%d frames)", filename, total)
+
+
+def _run_gps_step(filename: str, directory: str, key: str) -> None:
+    """Step 4: Extract GPS data from the video file."""
+    data_dir = Path(directory)
+    ddir = _data_dir(data_dir, filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        logger.error("No metadata for %s, skipping gps step", filename)
+        return
+
+    total = meta.get("total_frames", 0)
+
+    video_path = data_dir / filename
+    gps_data: list[dict] = []
+    if video_path.exists():
+        try:
+            gps_data = extract_gps(video_path)
+        except Exception:
+            logger.exception("Failed to extract GPS from %s", filename)
+
+    out_path = ddir / "gps.json.gz"
+    tmp_path = ddir / "gps.json.gz.tmp"
+    tmp_path.write_bytes(gzip.compress(json.dumps(gps_data).encode()))
+    tmp_path.rename(out_path)
+
+    _write_step_metadata(ddir, "gps", total)
+    logger.info("Finished gps step for %s (%d points)", filename, len(gps_data))
+
+
 def _process_video_worker(filename: str, directory: str, key: str) -> None:
     """Run all processing steps sequentially for one video."""
     try:
@@ -618,6 +686,10 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
                 _run_inference_step(filename, directory, key)
             elif step["name"] == "lead":
                 _run_lead_step(filename, directory, key)
+            elif step["name"] == "distances":
+                _run_distances_step(filename, directory, key)
+            elif step["name"] == "gps":
+                _run_gps_step(filename, directory, key)
     except Exception:
         logger.exception("Error processing video %s", filename)
     finally:
@@ -843,12 +915,47 @@ async def lead_timeline(filename: str, directory: str):
 @router.get("/lead-timeline-smooth")
 async def lead_timeline_smooth(filename: str, directory: str):
     """Return a PNG timeline of smoothed lead-car distance."""
+    # Prefer pre-computed data from distances step
+    ddir = _data_dir(Path(directory), filename)
+    dist_path = ddir / "distances.json.gz"
+    if dist_path.exists():
+        entries = json.loads(gzip.decompress(dist_path.read_bytes()))
+        smoothed: list[dict | None] = []
+        for entry in entries:
+            if entry is not None:
+                smoothed.append({"id": entry["tracker_id"], "distance": entry["distance"]})
+            else:
+                smoothed.append(None)
+        return Response(
+            content=_render_lead_timeline(smoothed),
+            media_type="image/png",
+        )
+    # Fallback: compute on the fly
     lead_data = _load_lead_data(directory, filename)
     smoothed = _smooth_lead_data(lead_data)
     return Response(
         content=_render_lead_timeline(smoothed),
         media_type="image/png",
     )
+
+
+@router.get("/gps-info")
+async def gps_info(filename: str, directory: str, frame: int):
+    """Return GPS info for a given frame."""
+    ddir = _data_dir(Path(directory), filename)
+    gps_path = ddir / "gps.json.gz"
+    if not gps_path.exists():
+        raise HTTPException(404, "GPS step not completed")
+
+    meta = _read_metadata(ddir)
+    video_fps = meta.get("fps", 30.0) if meta else 30.0
+    block_size = round(video_fps)
+
+    gps_data = json.loads(gzip.decompress(gps_path.read_bytes()))
+    gps_idx = frame // block_size
+
+    gps = gps_data[gps_idx] if gps_idx < len(gps_data) else None
+    return {"gps": gps}
 
 
 def _eval_hinge(z: float, coeffs, mode: str, zb: float) -> float:
