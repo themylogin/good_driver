@@ -768,10 +768,18 @@ def _smooth_lead_data(lead_data: list[dict | None], kernel: int = 15) -> list[di
             j += 1
         seg_len = j - i
         if seg_len <= _MAX_INTRUSION:
-            # Check if the surrounding context is a different tracker
-            prev_id = ids[i - 1] if i > 0 else -1
-            next_id = ids[j] if j < n else -1
-            # Erase if surrounded by a different id (or null) on both sides
+            # Look past nulls to find actual surrounding tracker ids
+            prev_id = -1
+            for k in range(i - 1, -1, -1):
+                if ids[k] >= 0:
+                    prev_id = ids[k]
+                    break
+            next_id = -1
+            for k in range(j, n):
+                if ids[k] >= 0:
+                    next_id = ids[k]
+                    break
+            # Erase if surrounded by a different id on both sides
             if prev_id != seg_id and next_id != seg_id:
                 ids[i:j] = -1
                 dists[i:j] = np.nan
