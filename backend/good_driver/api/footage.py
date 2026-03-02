@@ -697,6 +697,48 @@ async def get_frames(filename: str, batch: int, directory: str):
     return frames
 
 
+_LEAD_PALETTE = [
+    (0, 255, 0),    (255, 0, 0),    (0, 128, 255),  (255, 255, 0),
+    (255, 0, 255),  (0, 255, 255),  (255, 128, 0),  (128, 0, 255),
+    (0, 255, 128),  (255, 0, 128),  (128, 255, 0),  (0, 128, 128),
+    (255, 128, 128),(128, 128, 255),(128, 255, 255),(255, 255, 128),
+]
+
+
+@router.get("/lead-timeline")
+async def lead_timeline(filename: str, directory: str):
+    """Return a PNG timeline of lead-car distance, one column per frame."""
+    ddir = _data_dir(Path(directory), filename)
+    lead_path = ddir / "lead.json.gz"
+    if not lead_path.exists():
+        raise HTTPException(404, "Lead step not completed")
+
+    lead_data: list[dict | None] = json.loads(gzip.decompress(lead_path.read_bytes()))
+    total = len(lead_data)
+    if total == 0:
+        raise HTTPException(404, "No frames")
+
+    h = 50
+    img = np.zeros((h, total, 3), dtype=np.uint8)
+
+    max_distance = 100.0  # metres — clamp distances to this for scaling
+
+    for x, entry in enumerate(lead_data):
+        if entry is None:
+            continue
+        dist = min(entry["distance"], max_distance)
+        bar_h = max(1, int(dist / max_distance * (h / 2)))
+        color = _LEAD_PALETTE[entry["id"] % len(_LEAD_PALETTE)]
+        img[h - bar_h:h, x] = color
+
+    _, png = cv2.imencode(".png", img)
+    return Response(
+        content=png.tobytes(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 def _eval_hinge(z: float, coeffs, mode: str, zb: float) -> float:
     """Evaluate the centerline hinge model at a given Z."""
     m, n, a = coeffs

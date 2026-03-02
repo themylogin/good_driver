@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CameraParams } from "../App";
 
 // ---------------------------------------------------------------------------
@@ -235,6 +235,16 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     );
   }, [activeVideo, fps, directory, metas]);
 
+  // ── Lead timeline URL (available when lead step is complete) ────────────
+  const leadTimelineUrl = useMemo(() => {
+    if (!activeVideo) return null;
+    const meta = metas[activeVideo.filename];
+    const leadDone = meta && meta.total_frames > 0
+      && (meta.steps?.lead?.processed_frames ?? 0) >= meta.total_frames;
+    if (!leadDone) return null;
+    return `/api/footage/lead-timeline?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}`;
+  }, [activeVideo, directory, metas]);
+
   // ── Keyboard shortcuts ──────────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -452,6 +462,20 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                 />
               )}
             </div>
+
+            {/* Lead timeline */}
+            {leadTimelineUrl && (
+              <img
+                src={leadTimelineUrl}
+                style={{
+                  width: "100%",
+                  height: "50px",
+                  flexShrink: 0,
+                  display: "block",
+                  imageRendering: "pixelated",
+                }}
+              />
+            )}
 
             {/* Controls */}
             <div
