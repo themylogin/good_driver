@@ -705,37 +705,137 @@ _LEAD_PALETTE = [
 ]
 
 
-@router.get("/lead-timeline")
-async def lead_timeline(filename: str, directory: str):
-    """Return a PNG timeline of lead-car distance, one column per frame."""
+def _load_lead_data(directory: str, filename: str) -> list[dict | None]:
     ddir = _data_dir(Path(directory), filename)
     lead_path = ddir / "lead.json.gz"
     if not lead_path.exists():
         raise HTTPException(404, "Lead step not completed")
-
-    lead_data: list[dict | None] = json.loads(gzip.decompress(lead_path.read_bytes()))
-    total = len(lead_data)
-    if total == 0:
+    data = json.loads(gzip.decompress(lead_path.read_bytes()))
+    if len(data) == 0:
         raise HTTPException(404, "No frames")
+    return data
 
+
+def _render_lead_timeline(lead_data: list[dict | None]) -> bytes:
+    total = len(lead_data)
     h = 50
     img = np.zeros((h, total, 3), dtype=np.uint8)
+    max_distance = 100.0
 
-    max_distance = 100.0  # metres — clamp distances to this for scaling
+    # Build stable color mapping: assign palette index by first-appearance order
+    seen_ids: list[int] = []
+    for entry in lead_data:
+        if entry is not None and entry["id"] not in seen_ids:
+            seen_ids.append(entry["id"])
+    id_to_color = {tid: idx % len(_LEAD_PALETTE) for idx, tid in enumerate(seen_ids)}
 
     for x, entry in enumerate(lead_data):
         if entry is None:
             continue
         dist = min(entry["distance"], max_distance)
         bar_h = max(1, int(dist / max_distance * (h / 2)))
-        color = _LEAD_PALETTE[entry["id"] % len(_LEAD_PALETTE)]
+        color = _LEAD_PALETTE[id_to_color[entry["id"]]]
         img[h - bar_h:h, x] = color
 
     _, png = cv2.imencode(".png", img)
+    return png.tobytes()
+
+
+def _smooth_lead_data(lead_data: list[dict | None], kernel: int = 15) -> list[dict | None]:
+    """Smooth lead data: remove short intrusions, interpolate gaps, median-filter."""
+    from scipy.ndimage import median_filter
+
+    n = len(lead_data)
+    ids = np.full(n, -1, dtype=np.int32)
+    dists = np.full(n, np.nan, dtype=np.float64)
+
+    for i, entry in enumerate(lead_data):
+        if entry is not None:
+            ids[i] = entry["id"]
+            dists[i] = entry["distance"]
+
+    # Erase short intrusions: if tracker B appears for <=30 frames between
+    # runs of tracker A (or nulls), replace B with -1 so gap-fill can bridge.
+    _MAX_INTRUSION = 30
+    i = 0
+    while i < n:
+        if ids[i] < 0:
+            i += 1
+            continue
+        seg_id = ids[i]
+        j = i
+        while j < n and ids[j] == seg_id:
+            j += 1
+        seg_len = j - i
+        if seg_len <= _MAX_INTRUSION:
+            # Check if the surrounding context is a different tracker
+            prev_id = ids[i - 1] if i > 0 else -1
+            next_id = ids[j] if j < n else -1
+            # Erase if surrounded by a different id (or null) on both sides
+            if prev_id != seg_id and next_id != seg_id:
+                ids[i:j] = -1
+                dists[i:j] = np.nan
+        i = j
+
+    # Interpolate gaps up to 100 frames between same tracker id
+    _MAX_GAP = 100
+    last_id = -1
+    last_dist = np.nan
+    gap_start = -1
+    for i in range(n):
+        if ids[i] >= 0:
+            if gap_start >= 0 and ids[i] == last_id and (i - gap_start) <= _MAX_GAP:
+                gap_len = i - gap_start
+                for j in range(gap_start, i):
+                    t = (j - gap_start + 1) / (gap_len + 1)
+                    ids[j] = last_id
+                    dists[j] = last_dist + t * (dists[i] - last_dist)
+            last_id = ids[i]
+            last_dist = dists[i]
+            gap_start = -1
+        else:
+            if gap_start < 0:
+                gap_start = i
+
+    # Median-filter distance per contiguous tracker segment
+    result: list[dict | None] = [None] * n
+    i = 0
+    while i < n:
+        if ids[i] < 0:
+            i += 1
+            continue
+        seg_id = ids[i]
+        j = i
+        while j < n and ids[j] == seg_id:
+            j += 1
+        seg_dists = dists[i:j].copy()
+        if len(seg_dists) >= kernel:
+            seg_dists = median_filter(seg_dists, size=kernel)
+        for k in range(i, j):
+            result[k] = {"id": int(seg_id), "distance": round(float(seg_dists[k - i]), 1)}
+        i = j
+
+    return result
+
+
+@router.get("/lead-timeline")
+async def lead_timeline(filename: str, directory: str):
+    """Return a PNG timeline of raw lead-car distance."""
+    lead_data = _load_lead_data(directory, filename)
     return Response(
-        content=png.tobytes(),
+        content=_render_lead_timeline(lead_data),
         media_type="image/png",
-        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.get("/lead-timeline-smooth")
+async def lead_timeline_smooth(filename: str, directory: str):
+    """Return a PNG timeline of smoothed lead-car distance."""
+    lead_data = _load_lead_data(directory, filename)
+    smoothed = _smooth_lead_data(lead_data)
+    return Response(
+        content=_render_lead_timeline(smoothed),
+        media_type="image/png",
     )
 
 

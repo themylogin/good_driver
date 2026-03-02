@@ -235,14 +235,15 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
     );
   }, [activeVideo, fps, directory, metas]);
 
-  // ── Lead timeline URL (available when lead step is complete) ────────────
-  const leadTimelineUrl = useMemo(() => {
+  // ── Lead timeline URLs (available when lead step is complete) ───────────
+  const leadTimelineUrls = useMemo(() => {
     if (!activeVideo) return null;
     const meta = metas[activeVideo.filename];
     const leadDone = meta && meta.total_frames > 0
       && (meta.steps?.lead?.processed_frames ?? 0) >= meta.total_frames;
     if (!leadDone) return null;
-    return `/api/footage/lead-timeline?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}`;
+    const qs = `filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}`;
+    return { raw: `/api/footage/lead-timeline?${qs}`, smooth: `/api/footage/lead-timeline-smooth?${qs}` };
   }, [activeVideo, directory, metas]);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────────
@@ -463,18 +464,30 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
               )}
             </div>
 
-            {/* Lead timeline */}
-            {leadTimelineUrl && (
-              <img
-                src={leadTimelineUrl}
-                style={{
-                  width: "100%",
-                  height: "50px",
-                  flexShrink: 0,
-                  display: "block",
-                  imageRendering: "pixelated",
-                }}
-              />
+            {/* Lead timelines */}
+            {leadTimelineUrls && (
+              <>
+                <img
+                  src={leadTimelineUrls.raw}
+                  style={{
+                    width: "100%",
+                    height: "50px",
+                    flexShrink: 0,
+                    display: "block",
+                    imageRendering: "pixelated",
+                  }}
+                />
+                <img
+                  src={leadTimelineUrls.smooth}
+                  style={{
+                    width: "100%",
+                    height: "50px",
+                    flexShrink: 0,
+                    display: "block",
+                    imageRendering: "pixelated",
+                  }}
+                />
+              </>
             )}
 
             {/* Controls */}
