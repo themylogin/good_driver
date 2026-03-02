@@ -199,6 +199,8 @@ def _collect_speed_segments(
                 "speed_limit_kmh": snap_entry.get("speed_limit_kmh"),
                 "lat": snap_entry["lat"],
                 "lon": snap_entry["lon"],
+                "video": f.name,
+                "second": i,
             })
 
     all_points.sort(key=lambda p: p["ts"])
@@ -234,6 +236,9 @@ def _collect_speed_segments(
                 "speed_kmh": pt["speed_kmh"],
                 "lat": pt["lat"],
                 "lon": pt["lon"],
+                "ts": pt["ts"],
+                "video": pt["video"],
+                "second": pt["second"],
             })
 
         prev_ts = pt["ts"]
@@ -252,8 +257,9 @@ def _find_top_sections(
     top_n: int = 20,
 ) -> list[dict]:
     """Sliding-window search for the top-N fastest sections."""
-    # Min-heap of (avg_speed, mid_lat, mid_lon)
-    heap: list[tuple[float, float, float]] = []
+    # Min-heap of (avg_speed, counter, info_dict)
+    heap: list[tuple[float, int, dict]] = []
+    counter = 0
 
     for entries in segments:
         n = len(entries)
@@ -269,16 +275,37 @@ def _find_top_sections(
 
             avg = running_sum / window_seconds
             mid = entries[start + window_seconds // 2]
+            start_entry = entries[start]
+            info = {
+                "mid_lat": mid["lat"],
+                "mid_lon": mid["lon"],
+                "mid_ts": mid["ts"].isoformat(),
+                "start_lat": start_entry["lat"],
+                "start_lon": start_entry["lon"],
+                "video": start_entry["video"],
+                "second": start_entry["second"],
+            }
 
             if len(heap) < top_n:
-                heapq.heappush(heap, (avg, mid["lat"], mid["lon"]))
+                heapq.heappush(heap, (avg, counter, info))
+                counter += 1
             elif avg > heap[0][0]:
-                heapq.heapreplace(heap, (avg, mid["lat"], mid["lon"]))
+                heapq.heapreplace(heap, (avg, counter, info))
+                counter += 1
 
     results = sorted(heap, key=lambda t: t[0], reverse=True)
     return [
-        {"avg_speed_kmh": round(avg, 1), "mid_lat": lat, "mid_lon": lon}
-        for avg, lat, lon in results
+        {
+            "avg_speed_kmh": round(avg, 1),
+            "mid_lat": info["mid_lat"],
+            "mid_lon": info["mid_lon"],
+            "date": datetime.fromisoformat(info["mid_ts"]).astimezone().strftime("%Y-%m-%d %H:%M"),
+            "start_lat": info["start_lat"],
+            "start_lon": info["start_lon"],
+            "video": info["video"],
+            "second": info["second"],
+        }
+        for avg, _, info in results
     ]
 
 
@@ -312,7 +339,12 @@ async def top_speeding_sections(directory: str):
         settings = json.loads(settings_path.read_text())
         nominatim_url = settings.get("nominatim_url", nominatim_url)
 
-    # Compute top sections for each speed limit and window
+    # Compute top sections for each speed limit and window.
+    # Fetch extra candidates so that after deduplication by location we still
+    # have up to 20 rows.
+    _DISPLAY_N = 20
+    _FETCH_N = 200
+
     groups = []
     coords_to_geocode: set[tuple[float, float]] = set()
 
@@ -320,7 +352,7 @@ async def top_speeding_sections(directory: str):
         segments = _collect_speed_segments(directory, speed_limit)
         sections_by_window: dict[int, list[dict]] = {}
         for window_secs, _ in _SPEEDING_WINDOWS:
-            sections = _find_top_sections(segments, window_secs)
+            sections = _find_top_sections(segments, window_secs, top_n=_FETCH_N)
             sections_by_window[window_secs] = sections
             for s in sections:
                 coords_to_geocode.add((s["mid_lat"], s["mid_lon"]))
@@ -334,20 +366,30 @@ async def top_speeding_sections(directory: str):
                 client, nominatim_url, lat, lon,
             )
 
-    # Build response
+    # Build response (deduplicate by location: keep highest speed per location)
     result = []
     for speed_limit, sections_by_window in groups:
         tables = []
         for window_secs, window_label in _SPEEDING_WINDOWS:
-            rows = []
+            best_by_location: dict[str, dict] = {}
             for s in sections_by_window[window_secs]:
-                rows.append({
+                location = geocode_cache.get(
+                    (s["mid_lat"], s["mid_lon"]),
+                    f"{s['mid_lat']:.5f}, {s['mid_lon']:.5f}",
+                )
+                row = {
                     "avg_speed_kmh": s["avg_speed_kmh"],
-                    "location": geocode_cache.get(
-                        (s["mid_lat"], s["mid_lon"]),
-                        f"{s['mid_lat']:.5f}, {s['mid_lon']:.5f}",
-                    ),
-                })
+                    "location": location,
+                    "date": s["date"],
+                    "start_lat": s["start_lat"],
+                    "start_lon": s["start_lon"],
+                    "video": s["video"],
+                    "second": s["second"],
+                }
+                existing = best_by_location.get(location)
+                if existing is None or row["avg_speed_kmh"] > existing["avg_speed_kmh"]:
+                    best_by_location[location] = row
+            rows = sorted(best_by_location.values(), key=lambda r: r["avg_speed_kmh"], reverse=True)[:_DISPLAY_N]
             tables.append({
                 "window_seconds": window_secs,
                 "window_label": window_label,

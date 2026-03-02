@@ -124,6 +124,8 @@ function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta
 interface UploadFootageProps {
   directory: string;
   cameraParams: CameraParams;
+  navigateToVideo?: { filename: string; second: number } | null;
+  onNavigated?: () => void;
 }
 
 interface VideoEntry {
@@ -131,7 +133,7 @@ interface VideoEntry {
   video_url: string;
 }
 
-export default function UploadFootage({ directory }: UploadFootageProps) {
+export default function UploadFootage({ directory, navigateToVideo, onNavigated }: UploadFootageProps) {
   const [videos, setVideos] = useState<VideoEntry[]>([]);
   const [activeVideo, setActiveVideo] = useState<VideoEntry | null>(null);
   const [metas, setMetas] = useState<Record<string, VideoMeta>>({});
@@ -150,6 +152,8 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
   const isScrubbing = useRef(false);
   // ETA tracking: filename → first observed {frames, time} for current processing run
   const progressSnapshots = useRef<Record<string, ProgressSnapshot>>({});
+  // Navigation from analytics: seek to this second after video loads
+  const navSeekRef = useRef<number | null>(navigateToVideo?.second ?? null);
 
   // ── Fetch metadata for all videos ──────────────────────────────────────
   const fetchAllMeta = useCallback(async (videoList: VideoEntry[]) => {
@@ -186,10 +190,22 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
       .then((data) => {
         const vids: VideoEntry[] = data.videos ?? [];
         setVideos(vids);
-        // Restore last active video from localStorage (dev only)
-        const savedFilename = import.meta.env.DEV ? localStorage.getItem("gd_activeVideo") : null;
-        const saved = savedFilename ? vids.find((v) => v.filename === savedFilename) : null;
-        setActiveVideo(saved ?? vids[0] ?? null);
+        // If navigating from analytics, select that video
+        if (navigateToVideo) {
+          const navVideo = vids.find((v) => v.filename === navigateToVideo.filename);
+          if (navVideo) {
+            navSeekRef.current = navigateToVideo.second;
+            setActiveVideo(navVideo);
+            onNavigated?.();
+          } else {
+            setActiveVideo(vids[0] ?? null);
+          }
+        } else {
+          // Restore last active video from localStorage (dev only)
+          const savedFilename = import.meta.env.DEV ? localStorage.getItem("gd_activeVideo") : null;
+          const saved = savedFilename ? vids.find((v) => v.filename === savedFilename) : null;
+          setActiveVideo(saved ?? vids[0] ?? null);
+        }
         fetchAllMeta(vids);
       })
       .catch((e) => setErrorMessage(String(e)));
@@ -464,8 +480,14 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                   const vid = videoRef.current;
                   if (vid) {
                     setDuration(vid.duration);
-                    const savedTime = import.meta.env.DEV ? parseFloat(localStorage.getItem("gd_currentTime") ?? "0") : 0;
-                    const t = Math.min(savedTime, vid.duration || 0);
+                    let t: number;
+                    if (navSeekRef.current !== null) {
+                      t = Math.min(navSeekRef.current, vid.duration || 0);
+                      navSeekRef.current = null;
+                    } else {
+                      const savedTime = import.meta.env.DEV ? parseFloat(localStorage.getItem("gd_currentTime") ?? "0") : 0;
+                      t = Math.min(savedTime, vid.duration || 0);
+                    }
                     vid.currentTime = t;
                     setCurrentTime(t);
                     setIsPlaying(false);

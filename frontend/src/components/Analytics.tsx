@@ -8,6 +8,11 @@ interface SpeedLimit {
 interface SpeedingSection {
   avg_speed_kmh: number;
   location: string;
+  date: string;
+  start_lat: number;
+  start_lon: number;
+  video: string;
+  second: number;
 }
 
 interface SpeedingTable {
@@ -37,7 +42,12 @@ const tdStyle: React.CSSProperties = {
   borderBottom: "1px solid #eee",
 };
 
-export default function Analytics({ directory }: { directory: string }) {
+interface AnalyticsProps {
+  directory: string;
+  onNavigateToVideo?: (filename: string, second: number) => void;
+}
+
+export default function Analytics({ directory, onNavigateToVideo }: AnalyticsProps) {
   const [limits, setLimits] = useState<SpeedLimit[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -111,6 +121,7 @@ export default function Analytics({ directory }: { directory: string }) {
                     <tr>
                       <th style={thStyle}>#</th>
                       <th style={thStyle}>Avg speed (km/h)</th>
+                      <th style={thStyle}>Date</th>
                       <th style={thStyle}>Location</th>
                     </tr>
                   </thead>
@@ -119,7 +130,28 @@ export default function Analytics({ directory }: { directory: string }) {
                       <tr key={idx}>
                         <td style={tdStyle}>{idx + 1}</td>
                         <td style={tdStyle}>{section.avg_speed_kmh}</td>
-                        <td style={tdStyle}>{section.location}</td>
+                        <td style={tdStyle}>
+                          <a
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              onNavigateToVideo?.(section.video, section.second);
+                            }}
+                            style={{ color: "#0066cc", textDecoration: "none" }}
+                          >
+                            {section.date}
+                          </a>
+                        </td>
+                        <td style={tdStyle}>
+                          <a
+                            href={`https://www.google.com/maps?q=${section.start_lat},${section.start_lon}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: "#0066cc", textDecoration: "none" }}
+                          >
+                            {section.location}
+                          </a>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

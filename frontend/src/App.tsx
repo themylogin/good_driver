@@ -49,6 +49,7 @@ export default function App() {
   const [cameraParams, setCameraParams] = useState<CameraParams | null>(null);
   const [tabError, setTabError] = useState<string | null>(null);
   const [hasDebugDir, setHasDebugDir] = useState(false);
+  const [videoNavRequest, setVideoNavRequest] = useState<{ filename: string; second: number } | null>(null);
 
   // Check for Debug subdirectory
   useEffect(() => {
@@ -266,6 +267,20 @@ export default function App() {
     setActiveTab(tabId);
   };
 
+  const handleNavigateToVideo = async (filename: string, second: number) => {
+    setTabError(null);
+    if (!cameraParams) {
+      const res = await fetch(`/api/calibrate/params?directory=${encodeURIComponent(directory!)}`);
+      if (!res.ok) {
+        setTabError("Complete camera calibration first (need ≥ 2 fully annotated images).");
+        return;
+      }
+      setCameraParams(await res.json());
+    }
+    setVideoNavRequest({ filename, second });
+    setActiveTab("upload");
+  };
+
   // No directory open yet — show picker
   if (!directory) {
     return (
@@ -378,8 +393,8 @@ export default function App() {
       <div style={{ flex: 1, overflow: "hidden" }}>
         {activeTab === "settings" && <Settings directory={directory} />}
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
-        {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} />}
-        {activeTab === "analytics" && <Analytics directory={directory!} />}
+        {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} navigateToVideo={videoNavRequest} onNavigated={() => setVideoNavRequest(null)} />}
+        {activeTab === "analytics" && <Analytics directory={directory!} onNavigateToVideo={handleNavigateToVideo} />}
         {activeTab === "debug" && <DebugImages directory={directory!} />}
       </div>
     </div>
