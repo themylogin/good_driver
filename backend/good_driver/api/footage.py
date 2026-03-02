@@ -690,7 +690,7 @@ def _fit_centerline_and_lead(
 
     # Find the first car the centerline crosses, walking bottom-to-top.
     lead_det = None
-    bbox_extend_y = 5 * orig_h / _INPUT_H
+    bbox_extend_y = 0
     ego_mask = lane_masks[ego_idx] if ego_idx is not None and ego_idx < len(lane_masks) else None
     skip_dets: set[int] = set()
     all_cl = [*centerline_img, *centerline_extrap]
@@ -826,11 +826,10 @@ def _draw_overlays(
                 # f(θ) = fraction of bbox that is car width (empirical linear fit)
                 # f(90°) = 1.0, f(13°) = 0.73  →  hwc = hw / f(θ)
                 all_cl = [*centerline_img, *centerline_extrap]
-                _bbox_ext = 5 * orig_h / _INPUT_H
                 entry_idx = None
                 for _ci, (cpx, cpy) in enumerate(all_cl):
                     if (lead_det["x1"] <= cpx <= lead_det["x2"]
-                            and lead_det["y1"] <= cpy <= lead_det["y2"] + _bbox_ext):
+                            and lead_det["y1"] <= cpy <= lead_det["y2"]):
                         entry_idx = _ci
                         break
                 if entry_idx is not None and len(all_cl) >= 2:
