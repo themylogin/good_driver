@@ -4,9 +4,11 @@ import gzip
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
@@ -54,6 +56,7 @@ PROCESSING_STEPS = [
     {"name": "lead", "label": "Lead car"},
     {"name": "distances", "label": "Distances"},
     {"name": "gps", "label": "GPS"},
+    {"name": "snap_to_road", "label": "Snap to road"},
 ]
 
 
@@ -85,26 +88,37 @@ def _read_metadata(data_dir: Path) -> dict | None:
     if not p.exists():
         return None
     meta = json.loads(p.read_text())
-    # Backward compat: migrate top-level processed_frames → steps.inference
-    if "processed_frames" in meta:
-        steps = meta.setdefault("steps", {})
-        if "inference" not in steps:
-            steps["inference"] = {"processed_frames": meta["processed_frames"]}
-        del meta["processed_frames"]
+    # Strip legacy keys
+    meta.pop("processed_frames", None)
+    meta.pop("steps", None)
     return meta
 
 
-def _write_step_metadata(data_dir: Path, step_name: str, processed: int, **top_level_extra) -> None:
-    """Update a specific step's processed_frames in metadata."""
+def _write_metadata(data_dir: Path, **fields) -> None:
+    """Write/update metadata.json (video info only, no step progress)."""
     meta_path = data_dir / "metadata.json"
     meta: dict = {}
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
-    meta.update(top_level_extra)
-    steps = meta.setdefault("steps", {})
-    step = steps.setdefault(step_name, {})
-    step["processed_frames"] = processed
+    meta.update(fields)
+    meta.pop("steps", None)
     meta_path.write_text(json.dumps(meta))
+
+
+def _count_inference_frames(ddir: Path) -> int:
+    """Count how many frames have been inferred by checking batch files on disk."""
+    count = 0
+    for gz in ddir.rglob("*.json.gz"):
+        # Batch files are under tiled dirs like 0/00/00.json.gz
+        # Skip lead.json.gz, distances.json.gz, gps.json.gz etc.
+        if gz.parent == ddir:
+            continue
+        try:
+            data = json.loads(gzip.decompress(gz.read_bytes()))
+            count += len(data)
+        except Exception:
+            pass
+    return count
 
 
 def _is_step_complete(directory: str, filename: str, step_name: str) -> bool:
@@ -115,20 +129,24 @@ def _is_step_complete(directory: str, filename: str, step_name: str) -> bool:
     total = meta.get("total_frames", 0)
     if total == 0:
         return False
-    steps = meta.get("steps", {})
-    step_info = steps.get(step_name, {})
-    return step_info.get("processed_frames", 0) >= total
+    if step_name == "inference":
+        # Check that the last batch file exists
+        last_batch_start = ((total - 1) // 100) * 100
+        return _frame_file_path(ddir, last_batch_start).exists()
+    elif step_name == "lead":
+        return (ddir / "lead.json.gz").exists()
+    elif step_name == "distances":
+        return (ddir / "distances.json.gz").exists()
+    elif step_name == "gps":
+        return (ddir / "gps.json.gz").exists()
+    elif step_name == "snap_to_road":
+        return (ddir / "snap_to_road.json.gz").exists()
+    return False
 
 
-def _all_steps_complete(meta: dict | None) -> bool:
-    if meta is None:
-        return False
-    total = meta.get("total_frames", 0)
-    if total == 0:
-        return False
-    steps = meta.get("steps", {})
+def _all_steps_complete_from_dir(directory: str, filename: str) -> bool:
     return all(
-        steps.get(s["name"], {}).get("processed_frames", 0) >= total
+        _is_step_complete(directory, filename, s["name"])
         for s in PROCESSING_STEPS
     )
 
@@ -473,16 +491,19 @@ def _run_inference_step(filename: str, directory: str, key: str) -> None:
     ddir = _data_dir(data_dir, filename)
     ddir.mkdir(exist_ok=True)
 
-    # Resume from last completed batch boundary
-    meta = _read_metadata(ddir)
+    # Write video info to metadata (no step progress)
+    _write_metadata(ddir, total_frames=total,
+                    fps=cap.get(cv2.CAP_PROP_FPS),
+                    width=orig_w, height=orig_h)
+
+    # Resume from last completed batch boundary (check files on disk)
     resume_frame = 0
-    if meta is not None:
-        inf_processed = meta.get("steps", {}).get("inference", {}).get("processed_frames", 0)
-        resume_frame = (inf_processed // 100) * 100
-    _write_step_metadata(ddir, "inference", resume_frame,
-                         total_frames=total,
-                         fps=cap.get(cv2.CAP_PROP_FPS),
-                         width=orig_w, height=orig_h)
+    last_batch_start = ((total - 1) // 100) * 100
+    for batch_start in range(0, total, 100):
+        if _frame_file_path(ddir, batch_start).exists():
+            resume_frame = min(batch_start + 100, total)
+        else:
+            break
 
     # Seek to resume position
     if resume_frame > 0:
@@ -510,7 +531,6 @@ def _run_inference_step(filename: str, directory: str, key: str) -> None:
             fpath = _frame_file_path(ddir, first_frame)
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
-            _write_step_metadata(ddir, "inference", frame_n + 1)
             batch = []
 
         _live_progress[key] = {"step": "inference", "processed_frames": frame_n + 1}
@@ -523,7 +543,6 @@ def _run_inference_step(filename: str, directory: str, key: str) -> None:
         fpath.parent.mkdir(parents=True, exist_ok=True)
         fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
 
-    _write_step_metadata(ddir, "inference", frame_n)
     cap.release()
     logger.info("Finished inference for %s (%d frames)", filename, frame_n)
 
@@ -606,8 +625,6 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
             frame_n += 1
 
             _live_progress[key] = {"step": "lead", "processed_frames": frame_n}
-            if frame_n % 1000 == 0:
-                _write_step_metadata(ddir, "lead", frame_n)
 
     # Write result atomically
     out_path = ddir / "lead.json.gz"
@@ -615,7 +632,6 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
     tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
     tmp_path.rename(out_path)
 
-    _write_step_metadata(ddir, "lead", frame_n)
     logger.info("Finished lead step for %s (%d frames)", filename, frame_n)
 
 
@@ -652,7 +668,6 @@ def _run_distances_step(filename: str, directory: str, key: str) -> None:
     tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
     tmp_path.rename(out_path)
 
-    _write_step_metadata(ddir, "distances", total)
     logger.info("Finished distances step for %s (%d frames)", filename, total)
 
 
@@ -680,8 +695,209 @@ def _run_gps_step(filename: str, directory: str, key: str) -> None:
     tmp_path.write_bytes(gzip.compress(json.dumps(gps_data).encode()))
     tmp_path.rename(out_path)
 
-    _write_step_metadata(ddir, "gps", total)
     logger.info("Finished gps step for %s (%d points)", filename, len(gps_data))
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Snap to road (OSRM map matching)
+# ---------------------------------------------------------------------------
+
+_SNAP_CHUNK_SIZE = 100
+_SNAP_OVERLAP = 5
+_SNAP_RADIUS = 50
+
+
+def _load_settings(directory: str) -> dict:
+    """Load settings.json from the directory, with defaults."""
+    path = Path(directory) / "settings.json"
+    defaults = {"osrm_url": "http://localhost:5000"}
+    if path.exists():
+        return {**defaults, **json.loads(path.read_text())}
+    return defaults
+
+
+def _osrm_match_chunk(client: httpx.Client, osrm_url: str, points: list[dict]) -> dict:
+    """Call OSRM match API for a chunk of GPS points."""
+    coords = ";".join(f"{p['lon']},{p['lat']}" for p in points)
+    params: dict[str, str] = {
+        "overview": "false",
+        "geometries": "geojson",
+        "steps": "true",
+        "annotations": "true",
+        "radiuses": ";".join([str(_SNAP_RADIUS)] * len(points)),
+    }
+    timestamps = [p.get("ts") for p in points]
+    if all(t is not None for t in timestamps):
+        params["timestamps"] = ";".join(str(t) for t in timestamps)
+
+    resp = client.get(f"{osrm_url.rstrip('/')}/match/v1/driving/{coords}", params=params, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
+    """Step 5: Snap GPS track to road network via OSRM map matching."""
+    data_dir = Path(directory)
+    ddir = _data_dir(data_dir, filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        logger.error("No metadata for %s, skipping snap_to_road step", filename)
+        return
+
+    total = meta.get("total_frames", 0)
+
+    # Load raw GPS data from previous step
+    gps_path = ddir / "gps.json.gz"
+    if not gps_path.exists():
+        logger.error("No gps.json.gz for %s, skipping snap_to_road step", filename)
+        return
+
+    gps_data: list[dict] = json.loads(gzip.decompress(gps_path.read_bytes()))
+    if not gps_data:
+        # No GPS points — write empty result
+        out_path = ddir / "snap_to_road.json.gz"
+        tmp_path = ddir / "snap_to_road.json.gz.tmp"
+        tmp_path.write_bytes(gzip.compress(json.dumps([]).encode()))
+        tmp_path.rename(out_path)
+        logger.info("No GPS data for %s, wrote empty snap_to_road", filename)
+        return
+
+    settings = _load_settings(directory)
+    osrm_url = settings.get("osrm_url", "http://localhost:5000")
+
+    # Convert GPS entries to format for OSRM (lat, lon, unix timestamp)
+    points: list[dict] = []
+    for g in gps_data:
+        ts = None
+        if g.get("datetime"):
+            try:
+                dt = datetime.fromisoformat(g["datetime"].replace("Z", "+00:00"))
+                ts = int(dt.timestamp())
+            except (ValueError, TypeError):
+                pass
+        points.append({"lat": g["lat"], "lon": g["lon"], "ts": ts})
+
+    # Call OSRM in chunks
+    wp_lookup: dict[tuple[int, int], dict] = {}
+    all_matchings: list[dict] = []
+    all_tracepoints: list[dict | None] = []
+
+    step = _SNAP_CHUNK_SIZE - _SNAP_OVERLAP
+    chunk_num = -(-len(points) // step)
+
+    with httpx.Client() as client:
+        for i, start in enumerate(range(0, len(points), step)):
+            chunk = points[start : start + _SNAP_CHUNK_SIZE]
+
+            _live_progress[key] = {
+                "step": "snap_to_road",
+                "processed_frames": int((i + 1) / chunk_num * total) if chunk_num else total,
+            }
+
+            try:
+                data = _osrm_match_chunk(client, osrm_url, chunk)
+            except Exception:
+                logger.exception("OSRM match failed for chunk %d of %s", i, filename)
+                data = {"code": "Error"}
+
+            if data.get("code") != "Ok":
+                logger.warning("OSRM: %s — %s (chunk %d of %s)",
+                               data.get("code"), data.get("message", ""), i, filename)
+                tracepoints: list[dict | None] = [None] * len(chunk)
+                matchings: list[dict] = []
+            else:
+                offset = len(all_matchings)
+                tracepoints = data["tracepoints"]
+                for tp in tracepoints:
+                    if tp is not None:
+                        tp["matchings_index"] += offset
+                matchings = data["matchings"]
+
+            # Build waypoint lookup
+            for j, tp in enumerate(tracepoints):
+                if tp is None:
+                    continue
+                k = (tp["matchings_index"], tp["waypoint_index"])
+                if k not in wp_lookup:
+                    lon, lat = tp["location"]
+                    orig_idx = start + j
+                    wp_lookup[k] = {
+                        "lat": lat,
+                        "lon": lon,
+                        "datetime": gps_data[orig_idx].get("datetime"),
+                        "road_name": tp.get("name") or None,
+                        "orig_idx": orig_idx,
+                    }
+
+            if all_tracepoints:
+                tracepoints = tracepoints[_SNAP_OVERLAP:]
+            all_tracepoints.extend(tracepoints)
+            all_matchings.extend(matchings)
+
+    # Build per-tracepoint snapped data indexed by original GPS index
+    # tracepoint → (matching_idx, waypoint_idx) → lookup entry
+    snapped_by_orig: dict[int, dict] = {}
+    for tp in all_tracepoints:
+        if tp is None:
+            continue
+        k = (tp["matchings_index"], tp["waypoint_index"])
+        entry = wp_lookup.get(k)
+        if entry is not None:
+            snapped_by_orig[entry["orig_idx"]] = entry
+
+    # For speed and speed limit, build from legs (between consecutive waypoints)
+    leg_data_by_orig: dict[int, dict] = {}
+    for mi, matching in enumerate(all_matchings):
+        for li, leg in enumerate(matching.get("legs", [])):
+            wp_from = wp_lookup.get((mi, li))
+            if wp_from is None:
+                continue
+
+            speed_kmh = (
+                round(leg["distance"] / leg["duration"] * 3.6, 2)
+                if leg.get("duration", 0) > 0
+                else 0.0
+            )
+
+            speed_limit_kmh = None
+            steps = leg.get("steps", [])
+            if steps:
+                ref = steps[0].get("ref", "")
+                if ref:
+                    try:
+                        speed_limit_kmh = int(ref)
+                    except ValueError:
+                        pass
+
+            leg_data_by_orig[wp_from["orig_idx"]] = {
+                "speed_kmh": speed_kmh,
+                "speed_limit_kmh": speed_limit_kmh,
+            }
+
+    # Build final per-second result aligned to gps_data indices
+    result: list[dict | None] = []
+    for idx, g in enumerate(gps_data):
+        snapped = snapped_by_orig.get(idx)
+        leg = leg_data_by_orig.get(idx)
+        if snapped is not None:
+            result.append({
+                "timestamp": g.get("datetime"),
+                "lat": snapped["lat"],
+                "lon": snapped["lon"],
+                "speed_kmh": leg["speed_kmh"] if leg else 0.0,
+                "speed_limit_kmh": leg["speed_limit_kmh"] if leg else None,
+                "road_name": snapped.get("road_name"),
+            })
+        else:
+            result.append(None)
+
+    out_path = ddir / "snap_to_road.json.gz"
+    tmp_path = ddir / "snap_to_road.json.gz.tmp"
+    tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
+    tmp_path.rename(out_path)
+
+    matched = sum(1 for r in result if r is not None)
+    logger.info("Finished snap_to_road step for %s (%d/%d matched)", filename, matched, len(result))
 
 
 def _process_video_worker(filename: str, directory: str, key: str) -> None:
@@ -698,6 +914,8 @@ def _process_video_worker(filename: str, directory: str, key: str) -> None:
                 _run_distances_step(filename, directory, key)
             elif step["name"] == "gps":
                 _run_gps_step(filename, directory, key)
+            elif step["name"] == "snap_to_road":
+                _run_snap_to_road_step(filename, directory, key)
     except Exception:
         logger.exception("Error processing video %s", filename)
     finally:
@@ -750,17 +968,29 @@ async def get_metadata(filename: str, directory: str):
     meta = _read_metadata(ddir)
     if meta is None:
         return {"total_frames": 0, "steps": {}}
-    # Overlay live progress into the correct step
+    total = meta.get("total_frames", 0)
+
+    # Build steps from file existence
+    steps: dict[str, dict] = {}
+    for s in PROCESSING_STEPS:
+        name = s["name"]
+        if _is_step_complete(directory, filename, name):
+            steps[name] = {"processed_frames": total}
+        else:
+            steps[name] = {"processed_frames": 0}
+
+    # Overlay live progress for the currently running step
     key = f"{directory}|{filename}"
     live = _live_progress.get(key)
     current_step = None
     if live is not None:
         step_name = live["step"]
         current_step = step_name
-        steps = meta.setdefault("steps", {})
         step_info = steps.setdefault(step_name, {})
         if live["processed_frames"] > step_info.get("processed_frames", 0):
             step_info["processed_frames"] = live["processed_frames"]
+
+    meta["steps"] = steps
     meta["current_step"] = current_step
     meta["processing"] = key in _processing_videos
     return meta
@@ -964,6 +1194,25 @@ async def gps_info(filename: str, directory: str, frame: int):
 
     gps = gps_data[gps_idx] if gps_idx < len(gps_data) else None
     return {"gps": gps}
+
+
+@router.get("/snap-to-road-info")
+async def snap_to_road_info(filename: str, directory: str, frame: int):
+    """Return snapped-to-road info for a given frame."""
+    ddir = _data_dir(Path(directory), filename)
+    snap_path = ddir / "snap_to_road.json.gz"
+    if not snap_path.exists():
+        raise HTTPException(404, "Snap to road step not completed")
+
+    meta = _read_metadata(ddir)
+    video_fps = meta.get("fps", 30.0) if meta else 30.0
+    block_size = round(video_fps)
+
+    snap_data = json.loads(gzip.decompress(snap_path.read_bytes()))
+    idx = frame // block_size
+
+    snap = snap_data[idx] if idx < len(snap_data) else None
+    return {"snap": snap}
 
 
 def _eval_hinge(z: float, coeffs, mode: str, zb: float) -> float:
@@ -1633,9 +1882,7 @@ async def start_processing(directory: str):
         if key in _processing_videos:
             continue  # already queued or running
 
-        ddir = _data_dir(data_dir, filename)
-        meta = _read_metadata(ddir)
-        if _all_steps_complete(meta):
+        if _all_steps_complete_from_dir(directory, filename):
             continue  # already complete
 
         _processing_videos.add(key)

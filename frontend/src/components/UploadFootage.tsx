@@ -24,8 +24,8 @@ type VideoMeta = {
 
 const DEFAULT_FPS = 30;
 
-const STEP_LABELS: Record<string, string> = { inference: "Inference", lead: "Lead car", distances: "Distances", gps: "GPS" };
-const STEP_ORDER = ["inference", "lead", "distances", "gps"];
+const STEP_LABELS: Record<string, string> = { inference: "Inference", lead: "Lead car", distances: "Distances", gps: "GPS", snap_to_road: "Snap to road" };
+const STEP_ORDER = ["inference", "lead", "distances", "gps", "snap_to_road"];
 
 
 const btnStyle: React.CSSProperties = {
@@ -144,6 +144,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
   const [overlayUrl, setOverlayUrl] = useState<string | null>(null);
   const [debugImgUrl, setDebugImgUrl] = useState<string | null>(null);
   const [gpsInfo, setGpsInfo] = useState<{ gps: { lat: number; lon: number; datetime: string; speed_kmh: number } | null } | null>(null);
+  const [snapInfo, setSnapInfo] = useState<{ snap: { lat: number; lon: number; timestamp: string; speed_kmh: number; speed_limit_kmh: number | null; road_name: string | null } | null } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const isScrubbing = useRef(false);
@@ -249,6 +250,20 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
       .then((r) => r.ok ? r.json() : null)
       .then((data) => setGpsInfo(data ?? null))
       .catch(() => setGpsInfo(null));
+  }, [activeVideo, fps, directory, metas]);
+
+  // ── Fetch snap-to-road info for the current frame ───────────────────────
+  const updateSnapInfo = useCallback((time: number) => {
+    if (!activeVideo) { setSnapInfo(null); return; }
+    const meta = metas[activeVideo.filename];
+    const snapDone = meta && meta.total_frames > 0
+      && (meta.steps?.snap_to_road?.processed_frames ?? 0) >= meta.total_frames;
+    if (!snapDone) { setSnapInfo(null); return; }
+    const frameN = Math.floor(time * fps);
+    fetch(`/api/footage/snap-to-road-info?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => setSnapInfo(data ?? null))
+      .catch(() => setSnapInfo(null));
   }, [activeVideo, fps, directory, metas]);
 
   // ── Lead timeline URLs (available when lead step is complete) ───────────
@@ -433,12 +448,14 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                   if (!isScrubbing.current) setCurrentTime(vid.currentTime);
                   updateOverlay(vid.currentTime);
                   updateGpsInfo(vid.currentTime);
+                  updateSnapInfo(vid.currentTime);
                 }}
                 onSeeked={() => {
                   const vid = videoRef.current;
                   if (vid) {
                     updateOverlay(vid.currentTime);
                     updateGpsInfo(vid.currentTime);
+                    updateSnapInfo(vid.currentTime);
                     if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
                   }
                   setDebugImgUrl(null);
@@ -454,6 +471,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                     setIsPlaying(false);
                     updateOverlay(t);
                     updateGpsInfo(t);
+                    updateSnapInfo(t);
                   }
                 }}
               />
@@ -564,7 +582,23 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                   {gpsInfo?.gps && (
                     <>
                       {" | "}<a href={`https://www.google.com/maps?q=${gpsInfo.gps.lat},${gpsInfo.gps.lon}`} target="_blank" rel="noopener noreferrer">{gpsInfo.gps.lat.toFixed(5)}, {gpsInfo.gps.lon.toFixed(5)}</a>
+                      {snapInfo?.snap && (() => {
+                        const R = 6371000;
+                        const dLat = (snapInfo.snap.lat - gpsInfo.gps.lat) * Math.PI / 180;
+                        const dLon = (snapInfo.snap.lon - gpsInfo.gps.lon) * Math.PI / 180;
+                        const a = Math.sin(dLat / 2) ** 2 + Math.cos(gpsInfo.gps.lat * Math.PI / 180) * Math.cos(snapInfo.snap.lat * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+                        const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+                        return (
+                          <>
+                            {" | "}<a href={`https://www.google.com/maps?q=${snapInfo.snap.lat},${snapInfo.snap.lon}`} target="_blank" rel="noopener noreferrer">{snapInfo.snap.road_name || `${snapInfo.snap.lat.toFixed(5)}, ${snapInfo.snap.lon.toFixed(5)}`}</a>
+                            {" "}({dist < 1000 ? `${dist.toFixed(1)}m` : `${(dist / 1000).toFixed(2)}km`})
+                          </>
+                        );
+                      })()}
                       {" | "}{gpsInfo.gps.speed_kmh.toFixed(0)} km/h
+                      {snapInfo?.snap?.speed_limit_kmh != null && (
+                        <>{" "}<b>({snapInfo.snap.speed_limit_kmh} km/h)</b></>
+                      )}
                       {" | "}{gpsInfo.gps.datetime}
                     </>
                   )}
