@@ -683,7 +683,7 @@ def _run_gps_step(filename: str, directory: str, key: str) -> None:
     total = meta.get("total_frames", 0)
 
     video_path = data_dir / filename
-    gps_data: list[dict] = []
+    gps_data: list[dict | None] = []
     if video_path.exists():
         try:
             gps_data = extract_gps(video_path)
@@ -752,7 +752,7 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
         logger.error("No gps.json.gz for %s, skipping snap_to_road step", filename)
         return
 
-    gps_data: list[dict] = json.loads(gzip.decompress(gps_path.read_bytes()))
+    gps_data: list[dict | None] = json.loads(gzip.decompress(gps_path.read_bytes()))
     if not gps_data:
         # No GPS points — write empty result
         out_path = ddir / "snap_to_road.json.gz"
@@ -765,9 +765,15 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
     settings = _load_settings(directory)
     osrm_url = settings.get("osrm_url", "http://localhost:5000")
 
-    # Convert GPS entries to format for OSRM (lat, lon, unix timestamp)
+    # Convert GPS entries to format for OSRM (lat, lon, unix timestamp).
+    # gps_data may contain None entries (no GPS fix for that second), so we
+    # build a compact list of only valid points and keep a mapping back to
+    # the original (full-length) indices.
     points: list[dict] = []
-    for g in gps_data:
+    valid_to_orig: list[int] = []       # points[i] came from gps_data[valid_to_orig[i]]
+    for orig_idx, g in enumerate(gps_data):
+        if g is None:
+            continue
         ts = None
         if g.get("datetime"):
             try:
@@ -776,6 +782,17 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
             except (ValueError, TypeError):
                 pass
         points.append({"lat": g["lat"], "lon": g["lon"], "ts": ts})
+        valid_to_orig.append(orig_idx)
+
+    if not points:
+        # All GPS entries are None (no fix at all) — write all-None result
+        result = [None] * len(gps_data)
+        out_path = ddir / "snap_to_road.json.gz"
+        tmp_path = ddir / "snap_to_road.json.gz.tmp"
+        tmp_path.write_bytes(gzip.compress(json.dumps(result).encode()))
+        tmp_path.rename(out_path)
+        logger.info("No valid GPS fixes for %s, wrote all-None snap_to_road", filename)
+        return
 
     # Call OSRM in chunks
     wp_lookup: dict[tuple[int, int], dict] = {}
@@ -820,7 +837,7 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
                 k = (tp["matchings_index"], tp["waypoint_index"])
                 if k not in wp_lookup:
                     lon, lat = tp["location"]
-                    orig_idx = start + j
+                    orig_idx = valid_to_orig[start + j]
                     wp_lookup[k] = {
                         "lat": lat,
                         "lon": lon,
@@ -877,6 +894,9 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
     # Build final per-second result aligned to gps_data indices
     result: list[dict | None] = []
     for idx, g in enumerate(gps_data):
+        if g is None:
+            result.append(None)
+            continue
         snapped = snapped_by_orig.get(idx)
         leg = leg_data_by_orig.get(idx)
         if snapped is not None:

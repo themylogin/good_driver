@@ -107,13 +107,15 @@ def _parse_gps_atom(atom_pos: int, atom_size: int, fh) -> dict | None:
     return _parse_gps_payload(data[12:])
 
 
-def extract_gps(mp4_path: Path) -> list[dict]:
+def extract_gps(mp4_path: Path) -> list[dict | None]:
     """Extract GPS data from a Novatek MP4 file.
 
-    Returns a list of dicts, one per second:
-        {"lat": float, "lon": float, "datetime": str, "speed_kmh": float}
+    Returns a list with one entry per second of video.  Entries with a valid
+    GPS fix are dicts ``{"lat", "lon", "datetime", "speed_kmh"}``.  Entries
+    without a fix are ``None``.  The list length matches the video duration
+    in seconds so that index *i* always corresponds to second *i*.
     """
-    results: list[dict] = []
+    results: list[dict | None] = []
     with open(mp4_path, "rb") as fh:
         offset = 0
         while True:
@@ -130,8 +132,7 @@ def extract_gps(mp4_path: Path) -> list[dict]:
                         while gps_offset < sub_offset + sub_atom_size:
                             pos, size = _get_gps_atom_info(fh.read(8))
                             entry = _parse_gps_atom(pos, size, fh)
-                            if entry is not None:
-                                results.append(entry)
+                            results.append(entry)
                             gps_offset += 8
                             fh.seek(gps_offset)
                     sub_offset += sub_atom_size
