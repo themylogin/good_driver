@@ -242,26 +242,37 @@ def _build_lane_polygons(
                 else:
                     break
 
+            # Re-split: trimming may have disconnected merged regions.
+            # Keep only the sub-component closest to the bottom-center anchor.
+            # Runs before top-crop so the crop doesn't sever bridge rows
+            # that connect sub-components (wasting the crop budget).
+            if comp.any():
+                n_sub, sub_labels = cv2.connectedComponents(comp, connectivity=4)
+                if n_sub > 2:  # more than just background + one component
+                    best_sub = 0
+                    best_bottom = -1
+                    best_center_dist = float("inf")
+                    anchor_col = _INPUT_W // 2
+                    for s in range(1, n_sub):
+                        sub_rows = np.where((sub_labels == s).any(axis=1))[0]
+                        if len(sub_rows) == 0:
+                            continue
+                        bottom_row = int(sub_rows[-1])
+                        cols = np.where(sub_labels[bottom_row] == s)[0]
+                        center_dist = abs((cols[0] + cols[-1]) / 2 - anchor_col)
+                        if bottom_row > best_bottom or (
+                            bottom_row == best_bottom and center_dist < best_center_dist
+                        ):
+                            best_bottom = bottom_row
+                            best_center_dist = center_dist
+                            best_sub = s
+                    comp = (sub_labels == best_sub).astype(np.uint8)
+
             # Crop top N rows of ego lane
             active_rows = np.where(comp.any(axis=1))[0]
             if len(active_rows) > _EGO_TOP_CROP:
                 for r in active_rows[:_EGO_TOP_CROP]:
                     comp[r, :] = 0
-
-            # Re-split: trimming may have disconnected merged regions.
-            # Keep only the sub-component closest to the bottom-center anchor.
-            if comp.any():
-                n_sub, sub_labels = cv2.connectedComponents(comp, connectivity=4)
-                if n_sub > 2:  # more than just background + one component
-                    # Pick the sub-component whose lowest row is nearest to anchor
-                    best_sub = 0
-                    best_bottom = -1
-                    for s in range(1, n_sub):
-                        sub_rows = np.where((sub_labels == s).any(axis=1))[0]
-                        if len(sub_rows) > 0 and sub_rows[-1] > best_bottom:
-                            best_bottom = int(sub_rows[-1])
-                            best_sub = s
-                    comp = (sub_labels == best_sub).astype(np.uint8)
 
             # Discarded = everything in full ego model mask that isn't in the valid comp
             disc_model = (ego_full_model.astype(bool) & ~comp.astype(bool)).astype(np.uint8)
