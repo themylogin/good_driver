@@ -680,10 +680,59 @@ def _fit_centerline_and_lead(
     # Find the first car the centerline crosses, walking bottom-to-top.
     lead_det = None
     bbox_extend_y = 5 * orig_h / _INPUT_H
-    for cx_px, cy_px in (*centerline_img, *centerline_extrap):
-        for det in detections:
+    ego_mask = lane_masks[ego_idx] if ego_idx is not None and ego_idx < len(lane_masks) else None
+    skip_dets: set[int] = set()
+    all_cl = [*centerline_img, *centerline_extrap]
+    for ci, (cx_px, cy_px) in enumerate(all_cl):
+        for di, det in enumerate(detections):
+            if di in skip_dets:
+                continue
             if (det["x1"] <= cx_px <= det["x2"]
                     and det["y1"] <= cy_px <= det["y2"] + bbox_extend_y):
+                # Skip cars in another lane: if the centerline enters via
+                # a vertical (side) bbox edge and the ego lane extends 2+ px
+                # above the car's bottom, the car isn't in our lane.
+                if ci > 0 and ego_mask is not None:
+                    # Exact edge crossing: which bbox edge does the segment
+                    # (prev_point -> this_point) cross first?
+                    px, py = all_cl[ci - 1]
+                    dx, dy = cx_px - px, cy_px - py
+                    entered_side = False
+                    best_t = 2.0
+                    # Left edge (x = x1)
+                    if dx != 0:
+                        t = (det["x1"] - px) / dx
+                        if 0 <= t <= 1:
+                            yt = py + t * dy
+                            if det["y1"] <= yt <= det["y2"] + bbox_extend_y and t < best_t:
+                                best_t, entered_side = t, True
+                    # Right edge (x = x2)
+                    if dx != 0:
+                        t = (det["x2"] - px) / dx
+                        if 0 <= t <= 1:
+                            yt = py + t * dy
+                            if det["y1"] <= yt <= det["y2"] + bbox_extend_y and t < best_t:
+                                best_t, entered_side = t, True
+                    # Bottom edge (y = y2 + extend)
+                    if dy != 0:
+                        t = (det["y2"] + bbox_extend_y - py) / dy
+                        if 0 <= t <= 1:
+                            xt = px + t * dx
+                            if det["x1"] <= xt <= det["x2"] and t < best_t:
+                                best_t, entered_side = t, False
+                    # Top edge (y = y1)
+                    if dy != 0:
+                        t = (det["y1"] - py) / dy
+                        if 0 <= t <= 1:
+                            xt = px + t * dx
+                            if det["x1"] <= xt <= det["x2"] and t < best_t:
+                                best_t, entered_side = t, False
+
+                    if entered_side:
+                        check_y = det["y2"] - 2
+                        if 0 <= check_y < orig_h and ego_mask[:check_y + 1, :].any():
+                            skip_dets.add(di)
+                            continue
                 lead_det = det
                 break
         if lead_det is not None:
