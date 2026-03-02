@@ -26,7 +26,7 @@ from .calibrate import (
     _scale_boxes,
     solve_camera_params,
 )
-from ..segmentation_mask import encode_mask
+from ..segmentation_mask import encode_mask, decode_mask, DRIVEABLE, LANE_ON_DRIVEABLE, LANE_NO_DRIVEABLE
 from ..tracker import ByteTracker
 
 logger = logging.getLogger(__name__)
@@ -185,7 +185,8 @@ def _extract_masks(outputs) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def _build_lane_polygons(
-    outputs, orig_w: int, orig_h: int,
+    da_mask: np.ndarray, lane_mask: np.ndarray,
+    orig_w: int, orig_h: int,
 ) -> tuple[list[np.ndarray], int | None, np.ndarray | None]:
     """Split driveable area by lane separators into individual lane masks.
 
@@ -194,13 +195,7 @@ def _build_lane_polygons(
     (or None), and ego_discarded is a bool mask of discarded ego-lane pixels
     (bottom crop + edge-touching rows) at original resolution.
     """
-    masks_result = _extract_masks(outputs)
-    if masks_result is None:
-        return [], None, None
-
-    da_model, lane_cut = masks_result
-
-    da_cut = (da_model & (1 - lane_cut)).astype(np.uint8)
+    da_cut = (da_mask & (1 - lane_mask)).astype(np.uint8)
     da_cut[_INPUT_H - _BEV_BOTTOM_CROP:, :] = 0
     n_labels, da_labels_model = cv2.connectedComponents(da_cut, connectivity=4)
 
@@ -220,7 +215,7 @@ def _build_lane_polygons(
             # Build the full ego mask (including discarded) at model resolution
             ego_full_model = comp.copy()
             # Also include the bottom-cropped area from da_model for this label
-            da_cut_no_bottom = (da_model & (1 - lane_cut)).astype(np.uint8)
+            da_cut_no_bottom = (da_mask & (1 - lane_mask)).astype(np.uint8)
             ego_bottom = da_cut_no_bottom.copy()
             ego_bottom[:_INPUT_H - _BEV_BOTTOM_CROP, :] = 0
             ego_full_model = ego_full_model | ego_bottom
@@ -548,63 +543,32 @@ def _eval_hinge(z: float, coeffs, mode: str, zb: float) -> float:
         return m * z + n + a * max(0, zb - z) ** 2
 
 
-def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
-    """Render debug overlay on a BGR frame and return JPEG bytes."""
-    orig_h, orig_w = frame_bgr.shape[:2]
+def _fit_centerline_and_lead(
+    lane_masks: list[np.ndarray],
+    ego_idx: int | None,
+    detections: list[dict],
+    orig_w: int, orig_h: int,
+    cam: dict | None,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], dict | None]:
+    """Compute fitted centerline and identify lead car.
 
-    session = _get_session()
-    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    tensor, sx, sy = _preprocess(img)
-    outputs = session.run(None, {session.get_inputs()[0].name: tensor})
-
-    base = np.array(img, dtype=np.float32)
-    overlay = base.copy()
-    alpha = 0.4
-
-    lane_masks, ego_idx, ego_discarded = _build_lane_polygons(outputs, orig_w, orig_h)
-
-    if ego_idx is not None:
-        ego_full = lane_masks[ego_idx]
-        overlay[ego_full] = base[ego_full] * (1 - alpha) + np.array([0, 255, 0]) * alpha
-        if ego_discarded is not None and ego_discarded.any():
-            alpha_dim = 0.12
-            overlay[ego_discarded] = base[ego_discarded] * (1 - alpha_dim) + np.array([0, 255, 0]) * alpha_dim
-        for i, lm in enumerate(lane_masks):
-            if i != ego_idx and lm.any():
-                overlay[lm] = base[lm] * (1 - alpha) + np.array([0, 100, 255]) * alpha
-
-    if len(outputs) >= 5 and outputs[1] is not None:
-        ll_inner = outputs[1][0]
-        if ll_inner.shape[0] == 1:
-            ll_mask = (ll_inner[0] > _LANE_THRESHOLD).astype(np.uint8)
-        else:
-            ll_mask = ll_inner.argmax(axis=0).astype(np.uint8)
-        ll_full = cv2.resize(ll_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        lanes = ll_full == 1
-        if lanes.any():
-            overlay[lanes] = base[lanes] * (1 - alpha) + np.array([255, 0, 0]) * alpha
-
-    result = overlay.astype(np.uint8)
-
-    detections = _extract_detections(outputs, sx, sy, orig_w, orig_h)
-    cam = _load_camera_params(cam_directory)
-    lane_polys_world: list[tuple[list[tuple[float, float]], list[tuple[float, float]]]] = []
-    if cam is not None and lane_masks:
-        lane_polys_world, _ = _project_lane_boundaries(lane_masks, orig_w, orig_h, cam)
-    lane_interps = _build_lane_interps(lane_polys_world)
-    result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-
-    # Build ego lane centerline (world-space hinge model)
+    Returns (centerline_img, raw_centerline_img, lead_det).
+    """
     centerline_img: list[tuple[int, int]] = []
     raw_centerline_img: list[tuple[int, int]] = []
     best_coeffs = None
     best_zb = 0.0
     best_mode = "straight_then_curve"
-    if ego_idx is not None and ego_idx < len(lane_interps) and cam is not None:
-        interp = lane_interps[ego_idx]
+
+    if ego_idx is not None and ego_idx < len(lane_masks) and cam is not None:
+        lane_polys_world, _ = _project_lane_boundaries(lane_masks, orig_w, orig_h, cam)
+        lane_interps = _build_lane_interps(lane_polys_world)
+        if ego_idx < len(lane_interps):
+            interp = lane_interps[ego_idx]
+        else:
+            interp = None
         if interp is not None:
             zl, xl, zr, xr = interp
-            # Raw centerline: midpoint of left/right boundaries at each sample Z
             z_min = max(zl[0], zr[0])
             z_max = min(zl[-1], zr[-1])
             z_samples = np.linspace(z_min, z_max, 100)
@@ -612,7 +576,6 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                 (np.interp(z, zl, xl) + np.interp(z, zr, xr)) / 2.0
                 for z in z_samples
             ])
-            # Outlier rejection: truncate at first lateral velocity spike
             _dx = np.diff(cx_raw)
             _dz = np.diff(z_samples)
             _lat_vel = np.abs(_dx / _dz)
@@ -630,7 +593,7 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                     break
             cx_trimmed = cx_raw[_start:_cutoff]
             z_trimmed = z_samples[_start:_cutoff]
-            # Orange line: raw (untrimmed) points
+            # Raw centerline image points
             for i, z in enumerate(z_samples):
                 uv = _world_to_image(float(cx_raw[i]), float(z), orig_w, orig_h, cam)
                 if uv and 0 <= uv[0] < orig_w and 0 <= uv[1] < orig_h:
@@ -640,9 +603,6 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
             for i, z in enumerate(z_trimmed):
                 world_centers.append((float(cx_trimmed[i]), float(z)))
             # Fitted centerline: linear+parabolic hinge model
-            # X(Z) = m*Z + n + a*max(0, Z-Zb)^2  (straight then curves)
-            # or   = m*Z + n + a*max(0, Zb-Z)^2  (curves then straightens)
-            # For fixed Zb, linear in (m, n, a) — search over Zb.
             if len(world_centers) >= 3:
                 zs = np.array([p[1] for p in world_centers])
                 x_vals = np.array([p[0] for p in world_centers])
@@ -660,17 +620,14 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                         best_zb = zb
                         best_mode = mode
 
-                # Pure straight: X = m*Z + n  (a=0)
                 A_lin = np.column_stack([zs, np.ones_like(zs), np.zeros_like(zs)])
                 _try_fit(A_lin, "straight", 0.0)
                 straight_coeffs = best_coeffs.copy()
                 straight_err = best_err
 
-                # Pure curve: X = m*Z + n + a*Z^2
                 A_quad = np.column_stack([zs, np.ones_like(zs), zs ** 2])
                 _try_fit(A_quad, "curve", 0.0)
 
-                # Hinge: ~20 breakpoint candidates
                 for zb in np.linspace(z_lo, z_hi, 20):
                     for mode in ("straight_then_curve", "curve_then_straight"):
                         if mode == "straight_then_curve":
@@ -680,13 +637,11 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                         A = np.column_stack([zs, np.ones_like(zs), hinge])
                         _try_fit(A, mode, zb)
 
-                # Prefer straight if within 5% of the best fit
                 if best_mode != "straight" and straight_err <= best_err * 1.05:
                     best_coeffs = straight_coeffs
                     best_mode = "straight"
                     best_zb = 0.0
 
-                # Sample in image-Y space to guarantee edge-to-edge coverage
                 for v in range(orig_h - 1, -1, -1):
                     w = _image_to_world(orig_w / 2, v, orig_w, orig_h, cam)
                     if w is None or w[1] <= 0:
@@ -697,15 +652,12 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                         centerline_img.append((int(round(uv[0])), int(round(uv[1]))))
 
     # Find the closest car whose bbox the centerline crosses through.
-    # Evaluate the hinge model at each car's world Z to handle distant cars
-    # whose bboxes are beyond the drawn centerline.
     lead_det = None
     best_y2 = -1
-    bbox_extend_y = 5 * orig_h / _INPUT_H  # 5 model pixels downward
+    bbox_extend_y = 5 * orig_h / _INPUT_H
     if best_coeffs is not None and cam is not None:
         for det in detections:
             det_y2_ext = det["y2"] + bbox_extend_y
-            # Sample several Y positions within the extended bbox
             for frac in (1.0, 0.75, 0.5, 0.25, 0.0):
                 check_y = det["y1"] + frac * (det_y2_ext - det["y1"])
                 check_x = (det["x1"] + det["x2"]) / 2.0
@@ -720,20 +672,155 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
                         lead_det = det
                     break
 
+    return centerline_img, raw_centerline_img, lead_det
+
+
+def _draw_overlays(
+    canvas: np.ndarray,
+    lane_masks: list[np.ndarray],
+    ego_idx: int | None,
+    ego_discarded: np.ndarray | None,
+    lane_mask: np.ndarray,
+    detections: list[dict],
+    lead_det: dict | None,
+    centerline_img: list[tuple[int, int]],
+    raw_centerline_img: list[tuple[int, int]],
+    orig_w: int, orig_h: int,
+    cam: dict | None = None,
+) -> None:
+    """Draw all overlay elements onto a BGRA canvas (mutates in-place)."""
+    alpha = int(0.4 * 255)
+
+    # Lane polygons
+    if ego_idx is not None:
+        ego_full = lane_masks[ego_idx]
+        canvas[ego_full] = [0, 255, 0, alpha]
+        if ego_discarded is not None and ego_discarded.any():
+            canvas[ego_discarded] = [0, 255, 0, int(0.12 * 255)]
+        for i, lm in enumerate(lane_masks):
+            if i != ego_idx and lm.any():
+                canvas[lm] = [255, 100, 0, alpha]
+
+    # Lane separators
+    ll_full = cv2.resize(lane_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+    lanes = ll_full > 0
+    if lanes.any():
+        canvas[lanes] = [0, 0, 255, alpha]
+
+    # Bounding boxes — draw non-lead first, then lead on top
     for det in detections:
         if det is lead_det:
-            color = (0, 0, 255)
-        else:
-            color = (180, 180, 180)
-        cv2.rectangle(result_bgr, (det["x1"], det["y1"]),
-                      (det["x2"], det["y2"]), color, 2)
+            continue
+        cv2.rectangle(canvas, (det["x1"], det["y1"]),
+                      (det["x2"], det["y2"]), (180, 180, 180, 255), 2)
 
+    if lead_det is not None:
+        cv2.rectangle(canvas, (lead_det["x1"], lead_det["y1"]),
+                      (lead_det["x2"], lead_det["y2"]), (0, 0, 255, 255), 2)
+        # Estimate distance and draw labels above the lead car's bbox
+        if cam is not None:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = max(0.5, orig_h / 1080)
+            thickness = max(1, int(orig_h / 540))
+            lines: list[str] = []
+
+            fx_scaled = cam["fx"] * (orig_w / cam["image_width"])
+
+            # hGP: ground-plane projection (camera height + pitch)
+            cx = (lead_det["x1"] + lead_det["x2"]) / 2.0
+            w = _image_to_world(cx, lead_det["y2"], orig_w, orig_h, cam)
+            if w is not None and w[1] > 0:
+                lines.append(f"hGP: {w[1]:.0f}m")
+
+            # hh: apparent height (known car height ~1.5m vs bbox pixel height)
+            bbox_h_px = lead_det["y2"] - lead_det["y1"]
+            if bbox_h_px > 0:
+                lines.append(f"hh: {1.5 * fx_scaled / bbox_h_px:.0f}m")
+
+            # hw: apparent width (known car width ~2m vs bbox pixel width)
+            bbox_w_px = lead_det["x2"] - lead_det["x1"]
+            if bbox_w_px > 0:
+                lines.append(f"hw: {2.0 * fx_scaled / bbox_w_px:.0f}m")
+
+            if lines:
+                label = "  ".join(lines)
+                (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+                tx = lead_det["x1"] + (lead_det["x2"] - lead_det["x1"] - tw) // 2
+                ty = lead_det["y1"] - 6
+                cv2.rectangle(canvas, (tx - 2, ty - th - 2),
+                              (tx + tw + 2, ty + 2), (0, 0, 0, 200), -1)
+                cv2.putText(canvas, label, (tx, ty), font, scale,
+                            (255, 255, 255, 255), thickness, cv2.LINE_AA)
+
+    # Centerlines
     if len(raw_centerline_img) >= 2:
         raw_arr = np.array(raw_centerline_img, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(result_bgr, [raw_arr], False, (0, 165, 255), 2, cv2.LINE_AA)
+        cv2.polylines(canvas, [raw_arr], False, (0, 165, 255, 255), 2, cv2.LINE_AA)
     if len(centerline_img) >= 2:
         pts_arr = np.array(centerline_img, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(result_bgr, [pts_arr], False, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.polylines(canvas, [pts_arr], False, (0, 255, 255, 255), 2, cv2.LINE_AA)
+
+
+def _render_overlay_png(
+    da_mask: np.ndarray,
+    lane_mask: np.ndarray,
+    detections: list[dict],
+    orig_w: int, orig_h: int,
+    cam: dict | None,
+) -> bytes:
+    """Render overlay on transparent BGRA canvas and return PNG bytes."""
+    lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
+        da_mask, lane_mask, orig_w, orig_h)
+
+    centerline_img, raw_centerline_img, lead_det = _fit_centerline_and_lead(
+        lane_masks, ego_idx, detections, orig_w, orig_h, cam)
+
+    canvas = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
+    _draw_overlays(canvas, lane_masks, ego_idx, ego_discarded, lane_mask,
+                   detections, lead_det, centerline_img, raw_centerline_img,
+                   orig_w, orig_h, cam=cam)
+
+    _, png = cv2.imencode(".png", canvas)
+    return png.tobytes()
+
+
+def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
+    """Render debug overlay on a BGR frame and return JPEG bytes."""
+    orig_h, orig_w = frame_bgr.shape[:2]
+
+    session = _get_session()
+    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    tensor, sx, sy = _preprocess(img)
+    outputs = session.run(None, {session.get_inputs()[0].name: tensor})
+
+    detections = _extract_detections(outputs, sx, sy, orig_w, orig_h)
+    cam = _load_camera_params(cam_directory)
+
+    masks_result = _extract_masks(outputs)
+    if masks_result is not None:
+        da_mask, lane_mask_model = masks_result
+    else:
+        da_mask = np.zeros((_INPUT_H, _INPUT_W), dtype=np.uint8)
+        lane_mask_model = np.zeros((_INPUT_H, _INPUT_W), dtype=np.uint8)
+
+    # Render transparent overlay then composite onto the video frame
+    overlay_bgra = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
+    lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
+        da_mask, lane_mask_model, orig_w, orig_h)
+
+    centerline_img, raw_centerline_img, lead_det = _fit_centerline_and_lead(
+        lane_masks, ego_idx, detections, orig_w, orig_h, cam)
+
+    _draw_overlays(overlay_bgra, lane_masks, ego_idx, ego_discarded, lane_mask_model,
+                   detections, lead_det, centerline_img, raw_centerline_img,
+                   orig_w, orig_h, cam=cam)
+
+    # Composite BGRA overlay onto the video frame
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    overlay_alpha = overlay_bgra[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_rgb = overlay_bgra[:, :, :3][:, :, ::-1].astype(np.float32)  # BGRA→RGB
+    composited = frame_rgb * (1 - overlay_alpha) + overlay_rgb * overlay_alpha
+    result_bgr = cv2.cvtColor(composited.astype(np.uint8), cv2.COLOR_RGB2BGR)
 
     _, jpeg = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return jpeg.tobytes()
@@ -760,6 +847,53 @@ async def debug_frame(filename: str, directory: str, frame: int):
 
     jpeg_bytes = _render_debug(frame_bgr, Path(directory))
     return Response(content=jpeg_bytes, media_type="image/jpeg")
+
+
+@router.get("/overlay")
+async def get_overlay(filename: str, directory: str, frame: int):
+    """Return a transparent PNG overlay for a processed frame."""
+    ddir = _data_dir(Path(directory), filename)
+    meta = _read_metadata(ddir)
+    if meta is None:
+        raise HTTPException(404, "Video not processed")
+
+    batch_idx = frame // 100
+    fpath = _frame_file_path(ddir, batch_idx * 100)
+    if not fpath.exists():
+        raise HTTPException(404, f"Batch not processed")
+
+    raw = fpath.read_bytes()
+    frames = json.loads(gzip.decompress(raw) if fpath.suffix == ".gz" else raw)
+    frame_idx = frame % 100
+    if frame_idx >= len(frames):
+        raise HTTPException(404, f"Frame {frame} not found in batch")
+    frame_entry = frames[frame_idx]
+
+    mask_payload = frame_entry.get("mask")
+    if mask_payload is None:
+        raise HTTPException(404, "No mask data for frame")
+
+    orig_w = meta.get("width", _INPUT_W)
+    orig_h = meta.get("height", _INPUT_H)
+
+    # Decode mask to model-resolution class array and reconstruct full masks
+    classes_region = decode_mask(mask_payload)
+    classes_full = np.zeros((_INPUT_H, _INPUT_W), dtype=np.uint8)
+    start_row = mask_payload["start_row"]
+    classes_full[start_row:start_row + mask_payload["row_count"]] = classes_region
+
+    da_mask = ((classes_full == DRIVEABLE) | (classes_full == LANE_ON_DRIVEABLE)).astype(np.uint8)
+    lane_mask = ((classes_full == LANE_ON_DRIVEABLE) | (classes_full == LANE_NO_DRIVEABLE)).astype(np.uint8)
+
+    cam = _load_camera_params(Path(directory))
+    detections = frame_entry.get("detections", [])
+
+    png_bytes = _render_overlay_png(da_mask, lane_mask, detections, orig_w, orig_h, cam)
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/debug-images")

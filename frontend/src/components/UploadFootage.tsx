@@ -5,18 +5,6 @@ import type { CameraParams } from "../App";
 // Types
 // ---------------------------------------------------------------------------
 
-interface Detection {
-  track_id: number;
-  x1: number; y1: number; x2: number; y2: number;
-  confidence: number;
-}
-
-interface FrameEntry {
-  frame: number;
-  detections: Detection[];
-  lane_lines: number[][][];           // [line][[x,y],...]
-}
-
 type VideoMeta = { total_frames: number; processed_frames: number; fps?: number; processing?: boolean } | null;
 
 
@@ -25,11 +13,6 @@ type VideoMeta = { total_frames: number; processed_frames: number; fps?: number;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_FPS = 30;
-
-const BOX_COLORS = [
-  "#E53935", "#43A047", "#1E88E5", "#FB8C00",
-  "#8E24AA", "#00ACC1", "#F4511E", "#039BE5",
-];
 
 
 const btnStyle: React.CSSProperties = {
@@ -54,272 +37,6 @@ function formatTime(t: number): string {
   const s = Math.floor(t % 60);
   const cs = Math.floor((t % 1) * 100);
   return `${m}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
-}
-
-/**
- * Estimate distance to a detected object using solved camera parameters.
- * yBase: bottom edge of bounding box in VIDEO pixel coords.
- */
-function estimateDistance(
-  yBase: number,
-  videoWidth: number,
-  videoHeight: number,
-  params: CameraParams,
-): number | null {
-  // Scale fx from calibration image resolution to video resolution
-  const scale = videoWidth / params.image_width;
-  const fx = params.fx * scale;
-  const pitchRad = params.pitch_degrees * (Math.PI / 180);
-  const cy = videoHeight / 2;
-  const beta = Math.atan((yBase - cy) / fx);
-  const d = params.camera_height_m / Math.tan(beta + pitchRad);
-  return d > 0 && isFinite(d) && d < 500 ? Math.round(d * 10) / 10 : null;
-}
-
-/**
- * Back-project an image pixel to world ground-plane coordinates.
- * Returns { X: lateral metres (right+), Z: forward metres } or null if above horizon.
- */
-function imageToWorld(
-  u: number, v: number,
-  videoW: number, videoH: number,
-  params: CameraParams,
-): { X: number; Z: number } | null {
-  if (!params.fx || !params.image_width || !videoW || !videoH) return null;
-  const fxScaled = params.fx * (videoW / params.image_width);
-  const cx = videoW / 2;
-  const cy = videoH / 2;
-  const pitchRad = params.pitch_degrees * (Math.PI / 180);
-  const beta = Math.atan((v - cy) / fxScaled);
-  const angle = beta + pitchRad;
-  if (Math.tan(angle) <= 0) return null;  // point above or on horizon
-  const Z = params.camera_height_m / Math.tan(angle);
-  const X = (u - cx) * Z / fxScaled;
-  return { X, Z };
-}
-
-/** Inverse of imageToWorld: project world ground-plane point back to image pixel. */
-function worldToImage(
-  X: number, Z: number,
-  videoW: number, videoH: number,
-  params: CameraParams,
-): { u: number; v: number } | null {
-  if (!params.fx || !params.image_width || !videoW || !videoH || Z <= 0) return null;
-  const fxScaled = params.fx * (videoW / params.image_width);
-  const cx = videoW / 2;
-  const cy = videoH / 2;
-  const pitchRad = params.pitch_degrees * (Math.PI / 180);
-  const angle = Math.atan(params.camera_height_m / Z);
-  const beta = angle - pitchRad;
-  const v = cy + fxScaled * Math.tan(beta);
-  const u = cx + X * fxScaled / Z;
-  return { u, v };
-}
-
-/** Compute letterbox transform for object-fit:contain video inside a canvas. */
-function letterboxTransform(
-  canvasW: number, canvasH: number,
-  videoW: number, videoH: number,
-) {
-  if (!videoW || !videoH) return null;
-  const scale = Math.min(canvasW / videoW, canvasH / videoH);
-  return {
-    scale,
-    offsetX: (canvasW - videoW * scale) / 2,
-    offsetY: (canvasH - videoH * scale) / 2,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Canvas drawing
-// ---------------------------------------------------------------------------
-
-function drawOverlay(
-  canvas: HTMLCanvasElement,
-  videoEl: HTMLVideoElement,
-  frame: FrameEntry | null,
-  params: CameraParams,
-) {
-  const ctx = canvas.getContext("2d")!;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!frame) return;
-
-  const vw = videoEl.videoWidth;
-  const vh = videoEl.videoHeight;
-  const tx = letterboxTransform(canvas.width, canvas.height, vw, vh);
-  if (!tx) return;
-  const { scale, offsetX, offsetY } = tx;
-
-  // ── Lane lines (skeleton polyline + world-space extrapolation) ──
-  const EXTEND_Z = 20; // metres to extrapolate in world space
-  if (frame.lane_lines && frame.lane_lines.length > 0) {
-    for (const line of frame.lane_lines) {
-      const pts = line;
-      if (!pts || pts.length < 2) continue;
-
-      // Solid segment: draw skeleton polyline
-      ctx.strokeStyle = "#FFD700";
-      ctx.lineWidth = 2;
-      ctx.lineJoin = "round";
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0] * scale + offsetX, pts[0][1] * scale + offsetY);
-      for (let i = 1; i < pts.length; i++) {
-        ctx.lineTo(pts[i][0] * scale + offsetX, pts[i][1] * scale + offsetY);
-      }
-      ctx.stroke();
-
-      // Dotted extensions using local direction at endpoints in world space
-      const worldPts = pts
-        .map(([u, v]) => imageToWorld(u, v, vw, vh, params))
-        .filter(Boolean) as { X: number; Z: number }[];
-      if (worldPts.length < 2) continue;
-
-      // Sort by Z ascending (near → far)
-      const sorted = [...worldPts].sort((a, b) => a.Z - b.Z);
-      const N_LOCAL = Math.min(5, Math.max(2, Math.floor(sorted.length / 2)));
-
-      ctx.setLineDash([6, 4]);
-
-      // Extension towards horizon: use last N_LOCAL points (far end)
-      if (sorted.length >= 2) {
-        const farPts = sorted.slice(-N_LOCAL);
-        const farFit = fitWorldQuadratic(farPts);
-        if (farFit) {
-          const maxZ = farPts[farPts.length - 1].Z;
-          const extPts: [number, number][] = [];
-          for (let i = 0; i <= 15; i++) {
-            const Z = maxZ + EXTEND_Z * i / 15;
-            const X = evalQuadratic(farFit, Z);
-            const img = worldToImage(X, Z, vw, vh, params);
-            if (img) extPts.push([img.u * scale + offsetX, img.v * scale + offsetY]);
-          }
-          if (extPts.length >= 2) {
-            ctx.beginPath();
-            ctx.moveTo(extPts[0][0], extPts[0][1]);
-            for (let i = 1; i < extPts.length; i++) ctx.lineTo(extPts[i][0], extPts[i][1]);
-            ctx.stroke();
-          }
-        }
-      }
-
-      // Extension towards car: use first N_LOCAL points (near end)
-      if (sorted.length >= 2) {
-        const nearPts = sorted.slice(0, N_LOCAL);
-        const nearFit = fitWorldQuadratic(nearPts);
-        if (nearFit) {
-          const minZ = nearPts[0].Z;
-          const extNearZ = Math.max(0.5, minZ - EXTEND_Z);
-          if (extNearZ < minZ) {
-            const extPts: [number, number][] = [];
-            for (let i = 0; i <= 15; i++) {
-              const Z = extNearZ + (minZ - extNearZ) * i / 15;
-              const X = evalQuadratic(nearFit, Z);
-              const img = worldToImage(X, Z, vw, vh, params);
-              if (img) extPts.push([img.u * scale + offsetX, img.v * scale + offsetY]);
-            }
-            if (extPts.length >= 2) {
-              ctx.beginPath();
-              ctx.moveTo(extPts[0][0], extPts[0][1]);
-              for (let i = 1; i < extPts.length; i++) ctx.lineTo(extPts[i][0], extPts[i][1]);
-              ctx.stroke();
-            }
-          }
-        }
-      }
-      ctx.setLineDash([]);
-    }
-  }
-
-  // ── Bounding boxes + labels ──
-  for (const det of frame.detections) {
-    const color = BOX_COLORS[det.track_id % BOX_COLORS.length];
-    const cx1 = det.x1 * scale + offsetX;
-    const cy1 = det.y1 * scale + offsetY;
-    const bw  = (det.x2 - det.x1) * scale;
-    const bh  = (det.y2 - det.y1) * scale;
-
-    // Box border
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(cx1, cy1, bw, bh);
-
-    // Distance label (inside top-left of box)
-    const dist = estimateDistance(det.y2, vw, vh, params);
-    const label = dist !== null ? `${dist} m` : `${Math.round(det.confidence * 100)}%`;
-    const fontSize = Math.max(11, Math.min(16, bw / 6));
-    ctx.font = `bold ${fontSize}px system-ui`;
-    const tw = ctx.measureText(label).width;
-    const lh = fontSize + 4;
-    const lx = cx1 + 2;
-    const ly = cy1 + 2;
-
-    ctx.fillStyle = color;
-    ctx.fillRect(lx, ly, tw + 8, lh);
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(label, lx + 4, ly + fontSize - 1);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Lane fitting helpers
-// ---------------------------------------------------------------------------
-
-
-/**
- * Fit a quadratic X = a*Z² + b*Z + c to world-space points using least squares.
- * Falls back to linear if fewer than 3 points.
- * Returns coefficients [a, b, c] such that X = a*Z² + b*Z + c.
- */
-function fitWorldQuadratic(worldPts: { X: number; Z: number }[]): [number, number, number] | null {
-  if (worldPts.length < 2) return null;
-  if (worldPts.length < 3) {
-    // Linear fallback: X = b*Z + c
-    const [p0, p1] = worldPts;
-    const dz = p1.Z - p0.Z;
-    if (Math.abs(dz) < 1e-12) return null;
-    const b = (p1.X - p0.X) / dz;
-    const c = p0.X - b * p0.Z;
-    return [0, b, c];
-  }
-  // Normal equations for X = a*Z² + b*Z + c
-  let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
-  let t0 = 0, t1 = 0, t2 = 0;
-  for (const { X, Z } of worldPts) {
-    const z2 = Z * Z;
-    s0 += 1; s1 += Z; s2 += z2; s3 += z2 * Z; s4 += z2 * z2;
-    t0 += X; t1 += X * Z; t2 += X * z2;
-  }
-  // Solve 3x3 system via Cramer's rule
-  //  s4*a + s3*b + s2*c = t2
-  //  s3*a + s2*b + s1*c = t1
-  //  s2*a + s1*b + s0*c = t0
-  const det =
-    s4 * (s2 * s0 - s1 * s1) -
-    s3 * (s3 * s0 - s1 * s2) +
-    s2 * (s3 * s1 - s2 * s2);
-  if (Math.abs(det) < 1e-12) return null;
-  const a = (
-    t2 * (s2 * s0 - s1 * s1) -
-    s3 * (t1 * s0 - s1 * t0) +
-    s2 * (t1 * s1 - s2 * t0)
-  ) / det;
-  const b = (
-    s4 * (t1 * s0 - s1 * t0) -
-    t2 * (s3 * s0 - s1 * s2) +
-    s2 * (s3 * t0 - t1 * s2)
-  ) / det;
-  const c = (
-    s4 * (s2 * t0 - t1 * s1) -
-    s3 * (s3 * t0 - t1 * s2) +
-    t2 * (s3 * s1 - s2 * s2)
-  ) / det;
-  return [a, b, c];
-}
-
-/** Evaluate quadratic: X = coeffs[0]*Z² + coeffs[1]*Z + coeffs[2] */
-function evalQuadratic(coeffs: [number, number, number], Z: number): number {
-  return coeffs[0] * Z * Z + coeffs[1] * Z + coeffs[2];
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +101,7 @@ interface VideoEntry {
   video_url: string;
 }
 
-export default function UploadFootage({ directory, cameraParams }: UploadFootageProps) {
+export default function UploadFootage({ directory }: UploadFootageProps) {
   const [videos, setVideos] = useState<VideoEntry[]>([]);
   const [activeVideo, setActiveVideo] = useState<VideoEntry | null>(null);
   const [metas, setMetas] = useState<Record<string, VideoMeta>>({});
@@ -394,14 +111,11 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
   const [duration, setDuration] = useState(0);
   const [fps, setFps] = useState(DEFAULT_FPS);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [overlayUrl, setOverlayUrl] = useState<string | null>(null);
   const [debugImgUrl, setDebugImgUrl] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const isScrubbing = useRef(false);
-  // Cache batch data: batchIndex → FrameEntry[]
-  const batchCache = useRef<Record<number, FrameEntry[]>>({});
-  const frameDataRef = useRef<FrameEntry | null>(null);
   // ETA tracking: filename → first observed {frames, time} for current processing run
   const progressSnapshots = useRef<Record<string, ProgressSnapshot>>({});
 
@@ -452,9 +166,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
     if (import.meta.env.DEV) localStorage.setItem("gd_activeVideo", activeVideo.filename);
     const meta = metas[activeVideo.filename];
     if (meta?.fps) setFps(meta.fps);
-    // Clear stale frame data when switching video
-    batchCache.current = {};
-    frameDataRef.current = null;
+    setOverlayUrl(null);
     setDebugImgUrl(null);
   }, [activeVideo, metas]);
 
@@ -473,62 +185,19 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
     return () => clearInterval(id);
   }, [processingStarted, videos, fetchAllMeta]);
 
-  // ── Canvas drawing ──────────────────────────────────────────────────────
-  const redraw = useCallback(() => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
-    // Sync canvas resolution to its CSS size
-    if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
-      canvas.width = canvas.clientWidth;
-      canvas.height = canvas.clientHeight;
-    }
-    drawOverlay(canvas, video, frameDataRef.current, cameraParams);
-  }, [cameraParams]);
-
-  // Redraw when any canvas is resized
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ro = new ResizeObserver(redraw);
-    ro.observe(canvas);
-    return () => ro.disconnect();
-  }, [redraw]);
-
-  // ── Load frame data for the given time and redraw ───────────────────────
-  const loadFrameAndDraw = useCallback(async (time: number) => {
-    if (!activeVideo) return;
-    const filename = activeVideo.filename;
-
+  // ── Update overlay URL for the given time ──────────────────────────────
+  const updateOverlay = useCallback((time: number) => {
+    if (!activeVideo) { setOverlayUrl(null); return; }
+    const meta = metas[activeVideo.filename];
     const frameN = Math.floor(time * fps);
-    const batchIdx = Math.floor(frameN / 100);
-
-    // Cache hit — instant
-    if (batchCache.current[batchIdx]) {
-      frameDataRef.current = batchCache.current[batchIdx][frameN % 100] ?? null;
-      redraw();
+    if (!meta || meta.processed_frames <= frameN) {
+      setOverlayUrl(null);
       return;
     }
-
-    // Fetch batch
-    try {
-      const res = await fetch(
-        `/api/footage/frames?filename=${encodeURIComponent(filename)}&batch=${batchIdx}&directory=${encodeURIComponent(directory)}`,
-      );
-      if (!res.ok) {
-        // Batch not yet processed — clear overlay
-        frameDataRef.current = null;
-        redraw();
-        return;
-      }
-      const batch: FrameEntry[] = await res.json();
-      batchCache.current[batchIdx] = batch;
-      frameDataRef.current = batch[frameN % 100] ?? null;
-    } catch {
-      frameDataRef.current = null;
-    }
-    redraw();
-  }, [activeVideo, fps, redraw]);
+    setOverlayUrl(
+      `/api/footage/overlay?filename=${encodeURIComponent(activeVideo.filename)}&directory=${encodeURIComponent(directory)}&frame=${frameN}`,
+    );
+  }, [activeVideo, fps, directory, metas]);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────────
   useEffect(() => {
@@ -679,7 +348,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         {activeVideo ? (
           <>
-            {/* Video + canvas overlay + BEV */}
+            {/* Video + overlay */}
             <div style={{ flex: 1, background: "#1a1a1a", overflow: "hidden", position: "relative" }}>
               <video
                 key={activeVideo.filename}
@@ -696,12 +365,12 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   const vid = videoRef.current;
                   if (!vid) return;
                   if (!isScrubbing.current) setCurrentTime(vid.currentTime);
-                  loadFrameAndDraw(vid.currentTime);
+                  updateOverlay(vid.currentTime);
                 }}
                 onSeeked={() => {
                   const vid = videoRef.current;
                   if (vid) {
-                    loadFrameAndDraw(vid.currentTime);
+                    updateOverlay(vid.currentTime);
                     if (import.meta.env.DEV) localStorage.setItem("gd_currentTime", String(vid.currentTime));
                   }
                   setDebugImgUrl(null);
@@ -715,7 +384,7 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                     vid.currentTime = t;
                     setCurrentTime(t);
                     setIsPlaying(false);
-                    loadFrameAndDraw(t);
+                    updateOverlay(t);
                   }
                 }}
               />
@@ -731,15 +400,18 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                   }}
                 />
               )}
-              <canvas
-                ref={canvasRef}
-                style={{
-                  position: "absolute",
-                  top: 0, left: 0,
-                  width: "100%", height: "100%",
-                  pointerEvents: "none",
-                }}
-              />
+              {!debugImgUrl && overlayUrl && (
+                <img
+                  src={overlayUrl}
+                  style={{
+                    position: "absolute",
+                    top: 0, left: 0,
+                    width: "100%", height: "100%",
+                    objectFit: "contain",
+                    pointerEvents: "none",
+                  }}
+                />
+              )}
             </div>
 
             {/* Controls */}
@@ -782,8 +454,6 @@ export default function UploadFootage({ directory, cameraParams }: UploadFootage
                     const blob = await res.blob();
                     if (debugImgUrl) URL.revokeObjectURL(debugImgUrl);
                     setDebugImgUrl(URL.createObjectURL(blob));
-                    frameDataRef.current = null;
-                    redraw();
                   }}
                   style={btnStyle}
                 >
