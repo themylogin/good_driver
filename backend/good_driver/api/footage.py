@@ -564,12 +564,13 @@ def _fit_centerline_and_lead(
     detections: list[dict],
     orig_w: int, orig_h: int,
     cam: dict | None,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]], dict | None]:
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], dict | None]:
     """Compute fitted centerline and identify lead car.
 
-    Returns (centerline_img, raw_centerline_img, lead_det).
+    Returns (centerline_img, centerline_extrap, raw_centerline_img, lead_det).
     """
     centerline_img: list[tuple[int, int]] = []
+    centerline_extrap: list[tuple[int, int]] = []
     raw_centerline_img: list[tuple[int, int]] = []
     best_coeffs = None
     best_zb = 0.0
@@ -662,20 +663,33 @@ def _fit_centerline_and_lead(
                     if uv and 0 <= uv[0] < orig_w and 0 <= uv[1] < orig_h:
                         centerline_img.append((int(round(uv[0])), int(round(uv[1]))))
 
+                # Extrapolate past the horizon in image space
+                if len(centerline_img) >= 10:
+                    tail = np.array(centerline_img[-10:], dtype=np.float64)
+                    xs, ys = tail[:, 0], tail[:, 1]
+                    coeffs = np.polyfit(ys, xs, 1)
+                    last_x, last_y = centerline_img[-1]
+                    centerline_extrap.append((last_x, last_y))  # overlap point
+                    for ey in range(last_y - 1, -1, -1):
+                        ex = int(round(coeffs[0] * ey + coeffs[1]))
+                        if 0 <= ex < orig_w:
+                            centerline_extrap.append((ex, ey))
+                        else:
+                            break
+
     # Find the first car the centerline crosses, walking bottom-to-top.
     lead_det = None
     bbox_extend_y = 5 * orig_h / _INPUT_H
-    if centerline_img:
-        for cx_px, cy_px in centerline_img:  # already ordered bottom-to-top
-            for det in detections:
-                if (det["x1"] <= cx_px <= det["x2"]
-                        and det["y1"] <= cy_px <= det["y2"] + bbox_extend_y):
-                    lead_det = det
-                    break
-            if lead_det is not None:
+    for cx_px, cy_px in (*centerline_img, *centerline_extrap):
+        for det in detections:
+            if (det["x1"] <= cx_px <= det["x2"]
+                    and det["y1"] <= cy_px <= det["y2"] + bbox_extend_y):
+                lead_det = det
                 break
+        if lead_det is not None:
+            break
 
-    return centerline_img, raw_centerline_img, lead_det
+    return centerline_img, centerline_extrap, raw_centerline_img, lead_det
 
 
 def _draw_overlays(
@@ -687,6 +701,7 @@ def _draw_overlays(
     detections: list[dict],
     lead_det: dict | None,
     centerline_img: list[tuple[int, int]],
+    centerline_extrap: list[tuple[int, int]],
     raw_centerline_img: list[tuple[int, int]],
     orig_w: int, orig_h: int,
     cam: dict | None = None,
@@ -723,9 +738,10 @@ def _draw_overlays(
         # Estimate distance and draw labels above the lead car's bbox
         if cam is not None:
             font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = max(0.5, orig_h / 1080)
-            thickness = max(1, int(orig_h / 540))
+            scale = max(0.5, orig_h / 1080) * 0.6
+            thickness = max(1, int(orig_h / 540 * 0.6 + 1))
             lines: list[str] = []
+            hwc_label: str | None = None
 
             fx_scaled = cam["fx"] * (orig_w / cam["image_width"])
 
@@ -743,17 +759,59 @@ def _draw_overlays(
             # hw: apparent width (known car width ~2m vs bbox pixel width)
             bbox_w_px = lead_det["x2"] - lead_det["x1"]
             if bbox_w_px > 0:
-                lines.append(f"hw: {2.0 * fx_scaled / bbox_w_px:.0f}m")
+                hw_dist = 2.0 * fx_scaled / bbox_w_px
+                lines.append(f"hw: {hw_dist:.0f}m")
 
-            if lines:
-                label = "  ".join(lines)
-                (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
-                tx = lead_det["x1"] + (lead_det["x2"] - lead_det["x1"] - tw) // 2
-                ty = lead_det["y1"] - 6
-                cv2.rectangle(canvas, (tx - 2, ty - th - 2),
-                              (tx + tw + 2, ty + 2), (0, 0, 0, 200), -1)
-                cv2.putText(canvas, label, (tx, ty), font, scale,
-                            (255, 255, 255, 255), thickness, cv2.LINE_AA)
+                # hwc: angle-corrected width distance
+                # f(θ) = fraction of bbox that is car width (empirical linear fit)
+                # f(90°) = 1.0, f(13°) = 0.73  →  hwc = hw / f(θ)
+                all_cl = [*centerline_img, *centerline_extrap]
+                _bbox_ext = 5 * orig_h / _INPUT_H
+                entry_idx = None
+                for _ci, (cpx, cpy) in enumerate(all_cl):
+                    if (lead_det["x1"] <= cpx <= lead_det["x2"]
+                            and lead_det["y1"] <= cpy <= lead_det["y2"] + _bbox_ext):
+                        entry_idx = _ci
+                        break
+                if entry_idx is not None and len(all_cl) >= 2:
+                    lo = max(0, entry_idx - 5)
+                    hi = min(len(all_cl), entry_idx + 6)
+                    if hi - lo >= 2:
+                        seg = np.array(all_cl[lo:hi], dtype=np.float64)
+                        dx = seg[-1, 0] - seg[0, 0]
+                        dy = seg[-1, 1] - seg[0, 1]
+                        theta_deg = math.degrees(
+                            math.atan2(abs(dy), abs(dx)))
+                        f_theta = float(np.interp(
+                            theta_deg,
+                            [0, 13, 24, 40, 90],
+                            [0.60, 0.73, 0.86, 0.91, 1.0],
+                        ))
+                        f_theta = max(0.01, f_theta)
+                        hwc_dist = hw_dist / f_theta
+                        hwc_label = f"a: {theta_deg:.0f} hwc: {hwc_dist:.0f}m"
+
+            if lines or hwc_label:
+                bbox_cx = lead_det["x1"] + (lead_det["x2"] - lead_det["x1"]) // 2
+                bot_y = lead_det["y1"] - 6
+                # Line 2 (bottom): angle + hwc
+                if hwc_label:
+                    (tw2, th2), _ = cv2.getTextSize(hwc_label, font, scale, thickness)
+                    tx2 = bbox_cx - tw2 // 2
+                    cv2.rectangle(canvas, (tx2 - 2, bot_y - th2 - 2),
+                                  (tx2 + tw2 + 2, bot_y + 2), (0, 0, 0, 200), -1)
+                    cv2.putText(canvas, hwc_label, (tx2, bot_y), font, scale,
+                                (255, 255, 255, 255), thickness, cv2.LINE_AA)
+                    bot_y -= th2 + 4
+                # Line 1 (top): hGP hh hw
+                if lines:
+                    label = "  ".join(lines)
+                    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+                    tx = bbox_cx - tw // 2
+                    cv2.rectangle(canvas, (tx - 2, bot_y - th - 2),
+                                  (tx + tw + 2, bot_y + 2), (0, 0, 0, 200), -1)
+                    cv2.putText(canvas, label, (tx, bot_y), font, scale,
+                                (255, 255, 255, 255), thickness, cv2.LINE_AA)
 
     # Centerlines
     if len(raw_centerline_img) >= 2:
@@ -762,6 +820,15 @@ def _draw_overlays(
     if len(centerline_img) >= 2:
         pts_arr = np.array(centerline_img, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(canvas, [pts_arr], False, (0, 255, 255, 255), 2, cv2.LINE_AA)
+    # Extrapolated centerline as dashes
+    if len(centerline_extrap) >= 2:
+        _DASH = 12
+        _GAP = 8
+        for i in range(0, len(centerline_extrap) - 1, _DASH + _GAP):
+            seg = centerline_extrap[i : i + _DASH + 1]
+            if len(seg) >= 2:
+                seg_arr = np.array(seg, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(canvas, [seg_arr], False, (0, 255, 255, 255), 2, cv2.LINE_AA)
 
 
 def _render_overlay_png(
@@ -775,13 +842,13 @@ def _render_overlay_png(
     lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
         da_mask, lane_mask, orig_w, orig_h)
 
-    centerline_img, raw_centerline_img, lead_det = _fit_centerline_and_lead(
+    centerline_img, centerline_extrap, raw_centerline_img, lead_det = _fit_centerline_and_lead(
         lane_masks, ego_idx, detections, orig_w, orig_h, cam)
 
     canvas = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
     _draw_overlays(canvas, lane_masks, ego_idx, ego_discarded, lane_mask,
-                   detections, lead_det, centerline_img, raw_centerline_img,
-                   orig_w, orig_h, cam=cam)
+                   detections, lead_det, centerline_img, centerline_extrap,
+                   raw_centerline_img, orig_w, orig_h, cam=cam)
 
     _, png = cv2.imencode(".png", canvas)
     return png.tobytes()
@@ -811,12 +878,12 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
     lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
         da_mask, lane_mask_model, orig_w, orig_h)
 
-    centerline_img, raw_centerline_img, lead_det = _fit_centerline_and_lead(
+    centerline_img, centerline_extrap, raw_centerline_img, lead_det = _fit_centerline_and_lead(
         lane_masks, ego_idx, detections, orig_w, orig_h, cam)
 
     _draw_overlays(overlay_bgra, lane_masks, ego_idx, ego_discarded, lane_mask_model,
-                   detections, lead_det, centerline_img, raw_centerline_img,
-                   orig_w, orig_h, cam=cam)
+                   detections, lead_det, centerline_img, centerline_extrap,
+                   raw_centerline_img, orig_w, orig_h, cam=cam)
 
     # Composite BGRA overlay onto the video frame
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
