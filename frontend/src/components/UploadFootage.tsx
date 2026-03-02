@@ -466,13 +466,12 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
 
             {/* Lead timelines */}
             {leadTimelineUrls && (
-              <>
+              <div style={{ padding: "0 1rem", flexShrink: 0, background: "#000" }}>
                 <img
                   src={leadTimelineUrls.raw}
                   style={{
                     width: "100%",
                     height: "50px",
-                    flexShrink: 0,
                     display: "block",
                     imageRendering: "pixelated",
                   }}
@@ -482,18 +481,16 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
                   style={{
                     width: "100%",
                     height: "50px",
-                    flexShrink: 0,
                     display: "block",
                     imageRendering: "pixelated",
                   }}
                 />
-              </>
+              </div>
             )}
 
             {/* Controls */}
             <div
               style={{
-                borderTop: "1px solid #ddd",
                 padding: "0.5rem 1rem",
                 background: "#fff",
                 flexShrink: 0,
