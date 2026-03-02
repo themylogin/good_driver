@@ -862,19 +862,13 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
         if entry is not None:
             snapped_by_orig[entry["orig_idx"]] = entry
 
-    # For speed and speed limit, build from legs (between consecutive waypoints)
+    # For speed limit, build from legs (between consecutive waypoints)
     leg_data_by_orig: dict[int, dict] = {}
     for mi, matching in enumerate(all_matchings):
         for li, leg in enumerate(matching.get("legs", [])):
             wp_from = wp_lookup.get((mi, li))
             if wp_from is None:
                 continue
-
-            speed_kmh = (
-                round(leg["distance"] / leg["duration"] * 3.6, 2)
-                if leg.get("duration", 0) > 0
-                else 0.0
-            )
 
             speed_limit_kmh = None
             steps = leg.get("steps", [])
@@ -887,7 +881,6 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
                         pass
 
             leg_data_by_orig[wp_from["orig_idx"]] = {
-                "speed_kmh": speed_kmh,
                 "speed_limit_kmh": speed_limit_kmh,
             }
 
@@ -904,7 +897,6 @@ def _run_snap_to_road_step(filename: str, directory: str, key: str) -> None:
                 "timestamp": g.get("datetime"),
                 "lat": snapped["lat"],
                 "lon": snapped["lon"],
-                "speed_kmh": leg["speed_kmh"] if leg else 0.0,
                 "speed_limit_kmh": leg["speed_limit_kmh"] if leg else None,
                 "road_name": snapped.get("road_name"),
             })

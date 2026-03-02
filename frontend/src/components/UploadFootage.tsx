@@ -144,7 +144,7 @@ export default function UploadFootage({ directory }: UploadFootageProps) {
   const [overlayUrl, setOverlayUrl] = useState<string | null>(null);
   const [debugImgUrl, setDebugImgUrl] = useState<string | null>(null);
   const [gpsInfo, setGpsInfo] = useState<{ gps: { lat: number; lon: number; datetime: string; speed_kmh: number } | null } | null>(null);
-  const [snapInfo, setSnapInfo] = useState<{ snap: { lat: number; lon: number; timestamp: string; speed_kmh: number; speed_limit_kmh: number | null; road_name: string | null } | null } | null>(null);
+  const [snapInfo, setSnapInfo] = useState<{ snap: { lat: number; lon: number; timestamp: string; speed_limit_kmh: number | null; road_name: string | null } | null } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const isScrubbing = useRef(false);

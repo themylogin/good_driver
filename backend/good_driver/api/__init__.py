@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from .analytics import router as analytics_router
 from .calibrate import router as calibrate_router
 from .footage import router as footage_router
 from .health import router as health_router
@@ -12,3 +13,4 @@ router.include_router(settings_router)
 router.include_router(calibrate_router)
 router.include_router(footage_router)
 router.include_router(model_router)
+router.include_router(analytics_router)

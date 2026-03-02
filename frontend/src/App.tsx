@@ -379,7 +379,7 @@ export default function App() {
         {activeTab === "settings" && <Settings directory={directory} />}
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
         {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} />}
-        {activeTab === "analytics" && <Analytics />}
+        {activeTab === "analytics" && <Analytics directory={directory!} />}
         {activeTab === "debug" && <DebugImages directory={directory!} />}
       </div>
     </div>

@@ -19,6 +19,7 @@ dependencies = [
     "httpx>=0.28",
     "scikit-image>=0.26.0",
     "matplotlib>=3.10.8",
+    "mplcyberpunk>=0.7.6",
 ]
 
 [dependency-groups]
