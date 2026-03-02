@@ -248,6 +248,21 @@ def _build_lane_polygons(
                 for r in active_rows[:_EGO_TOP_CROP]:
                     comp[r, :] = 0
 
+            # Re-split: trimming may have disconnected merged regions.
+            # Keep only the sub-component closest to the bottom-center anchor.
+            if comp.any():
+                n_sub, sub_labels = cv2.connectedComponents(comp, connectivity=4)
+                if n_sub > 2:  # more than just background + one component
+                    # Pick the sub-component whose lowest row is nearest to anchor
+                    best_sub = 0
+                    best_bottom = -1
+                    for s in range(1, n_sub):
+                        sub_rows = np.where((sub_labels == s).any(axis=1))[0]
+                        if len(sub_rows) > 0 and sub_rows[-1] > best_bottom:
+                            best_bottom = int(sub_rows[-1])
+                            best_sub = s
+                    comp = (sub_labels == best_sub).astype(np.uint8)
+
             # Discarded = everything in full ego model mask that isn't in the valid comp
             disc_model = (ego_full_model.astype(bool) & ~comp.astype(bool)).astype(np.uint8)
             ego_discarded = cv2.resize(disc_model, (orig_w, orig_h),
@@ -581,18 +596,14 @@ def _fit_centerline_and_lead(
             _lat_vel = np.abs(_dx / _dz)
             _med_vel = max(float(np.median(_lat_vel)), 0.01)
             _thresh = max(_LATERAL_VEL_OUTLIER_MULT * _med_vel, _LATERAL_VEL_MIN_THRESH)
-            _cutoff = len(cx_raw)
+            # Mark points adjacent to lateral velocity spikes as outliers
+            _good = np.ones(len(cx_raw), dtype=bool)
             for _i in range(len(_lat_vel)):
                 if _lat_vel[_i] > _thresh:
-                    _cutoff = _i
-                    break
-            _start = 0
-            for _i in range(min(_cutoff, len(_lat_vel)) - 1, -1, -1):
-                if _lat_vel[_i] > _thresh:
-                    _start = _i + 1
-                    break
-            cx_trimmed = cx_raw[_start:_cutoff]
-            z_trimmed = z_samples[_start:_cutoff]
+                    _good[_i] = False
+                    _good[_i + 1] = False
+            cx_trimmed = cx_raw[_good]
+            z_trimmed = z_samples[_good]
             # Raw centerline image points
             for i, z in enumerate(z_samples):
                 uv = _world_to_image(float(cx_raw[i]), float(z), orig_w, orig_h, cam)
@@ -651,26 +662,18 @@ def _fit_centerline_and_lead(
                     if uv and 0 <= uv[0] < orig_w and 0 <= uv[1] < orig_h:
                         centerline_img.append((int(round(uv[0])), int(round(uv[1]))))
 
-    # Find the closest car whose bbox the centerline crosses through.
+    # Find the first car the centerline crosses, walking bottom-to-top.
     lead_det = None
-    best_y2 = -1
     bbox_extend_y = 5 * orig_h / _INPUT_H
-    if best_coeffs is not None and cam is not None:
-        for det in detections:
-            det_y2_ext = det["y2"] + bbox_extend_y
-            for frac in (1.0, 0.75, 0.5, 0.25, 0.0):
-                check_y = det["y1"] + frac * (det_y2_ext - det["y1"])
-                check_x = (det["x1"] + det["x2"]) / 2.0
-                w = _image_to_world(check_x, check_y, orig_w, orig_h, cam)
-                if w is None or w[1] <= 0:
-                    continue
-                xw = _eval_hinge(w[1], best_coeffs, best_mode, best_zb)
-                uv = _world_to_image(float(xw), w[1], orig_w, orig_h, cam)
-                if uv and det["x1"] <= uv[0] <= det["x2"] and det["y1"] <= uv[1] <= det_y2_ext:
-                    if det["y2"] > best_y2:
-                        best_y2 = det["y2"]
-                        lead_det = det
+    if centerline_img:
+        for cx_px, cy_px in centerline_img:  # already ordered bottom-to-top
+            for det in detections:
+                if (det["x1"] <= cx_px <= det["x2"]
+                        and det["y1"] <= cy_px <= det["y2"] + bbox_extend_y):
+                    lead_det = det
                     break
+            if lead_det is not None:
+                break
 
     return centerline_img, raw_centerline_img, lead_det
 
