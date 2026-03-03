@@ -113,7 +113,7 @@ def _render_safety_index_chart(by_bucket: dict[int, list[float]]) -> bytes:
         ax.set_ylim(0, 1.05)
         ax.set_yticks(np.arange(0, 1.1, 0.1))
         ax.set_title(
-            f"Safety Index by Driving Speed (Total: {_fmt_duration(total_seconds)})",
+            f"Safety Index by Driving Speed (Total Travel Time: {_fmt_duration(total_seconds)})",
             fontsize=20,
         )
         ax.legend()
@@ -185,7 +185,7 @@ def _render_safety_index_distribution_chart(values: list[float], speed_bucket: i
 
         ax.set_title(
             f"Safety Index Distribution at {speed_bucket}–{speed_bucket + BIN_SIZE} km/h "
-            f"(Total: {_fmt_duration(total)})",
+            f"(Total Travel Time: {_fmt_duration(total)})",
             fontsize=20,
         )
 
@@ -256,7 +256,7 @@ def _render_safety_index_cumulative_chart(values: list[float], speed_bucket: int
 
         ax.set_title(
             f"Cumulative Safety Index at {speed_bucket}\u2013{speed_bucket + BIN_SIZE} km/h "
-            f"(Total: {_fmt_duration(total)})",
+            f"(Total Travel Time: {_fmt_duration(total)})",
             fontsize=20,
         )
 
