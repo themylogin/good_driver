@@ -299,6 +299,7 @@ def _find_top_sections(
             "avg_speed_kmh": round(avg, 1),
             "mid_lat": info["mid_lat"],
             "mid_lon": info["mid_lon"],
+            "mid_ts": datetime.fromisoformat(info["mid_ts"]),
             "date": datetime.fromisoformat(info["mid_ts"]).astimezone().strftime("%Y-%m-%d %H:%M"),
             "start_lat": info["start_lat"],
             "start_lon": info["start_lon"],
@@ -311,18 +312,32 @@ def _find_top_sections(
 
 async def _reverse_geocode(
     client: httpx.AsyncClient, nominatim_url: str, lat: float, lon: float,
-) -> str:
+) -> tuple[str, str]:
+    """Return (display_name, municipality) for given coordinates."""
+    fallback = f"{lat:.5f}, {lon:.5f}"
     try:
         resp = await client.get(
             f"{nominatim_url.rstrip('/')}/reverse",
-            params={"lat": lat, "lon": lon, "format": "json", "zoom": 16},
+            params={"lat": lat, "lon": lon, "format": "json", "zoom": 16,
+                     "addressdetails": 1},
             timeout=10.0,
         )
         if resp.status_code == 200:
-            return resp.json().get("display_name", f"{lat:.5f}, {lon:.5f}")
+            data = resp.json()
+            display_name = data.get("display_name", fallback)
+            address = data.get("address", {})
+            municipality = (
+                address.get("city")
+                or address.get("town")
+                or address.get("village")
+                or address.get("municipality")
+                or address.get("county")
+                or fallback
+            )
+            return display_name, municipality
     except Exception:
         pass
-    return f"{lat:.5f}, {lon:.5f}"
+    return fallback, fallback
 
 
 @router.get("/top-speeding-sections")
@@ -359,23 +374,39 @@ async def top_speeding_sections(directory: str):
         groups.append((speed_limit, sections_by_window))
 
     # Reverse-geocode all unique coordinates
-    geocode_cache: dict[tuple[float, float], str] = {}
+    geocode_cache: dict[tuple[float, float], tuple[str, str]] = {}
     async with httpx.AsyncClient() as client:
         for lat, lon in coords_to_geocode:
             geocode_cache[(lat, lon)] = await _reverse_geocode(
                 client, nominatim_url, lat, lon,
             )
 
-    # Build response (deduplicate by location: keep highest speed per location)
+    # Build response
     result = []
     for speed_limit, sections_by_window in groups:
         tables = []
         for window_secs, window_label in _SPEEDING_WINDOWS:
-            best_by_location: dict[str, dict] = {}
+            # 1) Deduplicate by proximity: sections whose timestamps
+            #    are within 5x the window are overlapping;
+            #    keep only the fastest.
+            proximity_threshold = 5 * window_secs
+            kept: list[dict] = []
             for s in sections_by_window[window_secs]:
-                location = geocode_cache.get(
+                dominated = False
+                for k in kept:
+                    if abs((k["mid_ts"] - s["mid_ts"]).total_seconds()) < proximity_threshold:
+                        dominated = True
+                        break
+                if not dominated:
+                    kept.append(s)
+
+            # 2) Deduplicate by municipality: keep highest speed per municipality.
+            best_by_municipality: dict[str, dict] = {}
+            for s in kept:
+                fallback = f"{s['mid_lat']:.5f}, {s['mid_lon']:.5f}"
+                location, municipality = geocode_cache.get(
                     (s["mid_lat"], s["mid_lon"]),
-                    f"{s['mid_lat']:.5f}, {s['mid_lon']:.5f}",
+                    (fallback, fallback),
                 )
                 row = {
                     "avg_speed_kmh": s["avg_speed_kmh"],
@@ -386,10 +417,10 @@ async def top_speeding_sections(directory: str):
                     "video": s["video"],
                     "second": s["second"],
                 }
-                existing = best_by_location.get(location)
+                existing = best_by_municipality.get(municipality)
                 if existing is None or row["avg_speed_kmh"] > existing["avg_speed_kmh"]:
-                    best_by_location[location] = row
-            rows = sorted(best_by_location.values(), key=lambda r: r["avg_speed_kmh"], reverse=True)[:_DISPLAY_N]
+                    best_by_municipality[municipality] = row
+            rows = sorted(best_by_municipality.values(), key=lambda r: r["avg_speed_kmh"], reverse=True)[:_DISPLAY_N]
             tables.append({
                 "window_seconds": window_secs,
                 "window_label": window_label,
