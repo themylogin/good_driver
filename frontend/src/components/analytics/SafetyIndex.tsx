@@ -1,11 +1,25 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface SafetyIndexProps {
   directory: string;
 }
 
+interface Bucket {
+  speed_bucket: number;
+  count: number;
+}
+
 export default function SafetyIndex({ directory }: SafetyIndexProps) {
   const [noLeadAsSafe, setNoLeadAsSafe] = useState(false);
+  const [buckets, setBuckets] = useState<Bucket[]>([]);
+
+  useEffect(() => {
+    fetch(
+      `/api/analytics/safety-index-buckets?directory=${encodeURIComponent(directory)}&no_lead_as_safe=${noLeadAsSafe}`
+    )
+      .then((r) => (r.ok ? r.json() : { buckets: [] }))
+      .then((data) => setBuckets(data.buckets));
+  }, [directory, noLeadAsSafe]);
 
   return (
     <div>
@@ -40,6 +54,15 @@ export default function SafetyIndex({ directory }: SafetyIndexProps) {
         alt="Safety index by driving speed"
         style={{ width: "100%", maxWidth: 1920 }}
       />
+      {buckets.map((b) => (
+        <div key={b.speed_bucket} style={{ marginTop: "1rem" }}>
+          <img
+            src={`/api/analytics/safety-index-distribution-chart?directory=${encodeURIComponent(directory)}&speed_bucket=${b.speed_bucket}&no_lead_as_safe=${noLeadAsSafe}`}
+            alt={`Safety index distribution at ${b.speed_bucket} km/h`}
+            style={{ width: "100%", maxWidth: 1920 }}
+          />
+        </div>
+      ))}
     </div>
   );
 }

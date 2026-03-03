@@ -138,6 +138,82 @@ def _render_safety_index_chart(by_bucket: dict[int, list[float]]) -> bytes:
         return buf.read()
 
 
+def _render_safety_index_distribution_chart(values: list[float], speed_bucket: int) -> bytes:
+    """Render a histogram of safety index values for a single speed bucket."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mplcyberpunk
+    import numpy as np
+
+    total = len(values)
+
+    def _fmt_duration(seconds: int) -> str:
+        days, remainder = divmod(int(seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if not parts:
+            parts.append(f"{int(seconds)}s")
+        return " ".join(parts)
+
+    labels = [f"{e:.1f}" for e in np.arange(0, 1.0, 0.1)] + ["1.0"]
+
+    counts = [0] * len(labels)
+    for v in values:
+        if v >= 1.0:
+            counts[-1] += 1
+        else:
+            idx = int(v / 0.1)
+            counts[idx] += 1
+
+    with plt.style.context("cyberpunk"):
+        fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+
+        ax.bar(range(len(labels)), counts)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels)
+        ax.set_xlabel("Safety Index")
+        ax.yaxis.set_major_formatter(lambda x, _pos: _fmt_duration(x))
+
+        ax.set_title(
+            f"Safety Index Distribution at {speed_bucket}–{speed_bucket + BIN_SIZE} km/h "
+            f"(Total: {_fmt_duration(total)})",
+            fontsize=20,
+        )
+
+        for rect in ax.patches:
+            y_value = rect.get_height()
+            x_value = rect.get_x() + rect.get_width() / 2
+            if y_value == 0:
+                continue
+            pct = y_value / total * 100
+            label = f"{pct:.0f}%" if pct == int(pct) else f"{pct:.1f}%"
+            ax.annotate(
+                label,
+                (x_value, y_value),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+            )
+
+        mplcyberpunk.add_glow_effects(ax)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+
 @router.get("/safety-index-chart")
 async def safety_index_chart(directory: str, no_lead_as_safe: bool = False):
     """Return a PNG safety index chart grouped by driving speed."""
@@ -150,6 +226,43 @@ async def safety_index_chart(directory: str, no_lead_as_safe: bool = False):
         raise HTTPException(404, "No data with both GPS speed and following distance")
 
     png = _render_safety_index_chart(by_bucket)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/safety-index-buckets")
+async def safety_index_buckets(directory: str, no_lead_as_safe: bool = False):
+    """Return available speed buckets with sample counts."""
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
+
+    by_bucket = _collect_safety_data(directory, no_lead_as_safe=no_lead_as_safe)
+    buckets = [
+        {"speed_bucket": k, "count": len(v)}
+        for k, v in sorted(by_bucket.items(), reverse=True)
+    ]
+    return {"buckets": buckets}
+
+
+@router.get("/safety-index-distribution-chart")
+async def safety_index_distribution_chart(
+    directory: str, speed_bucket: int, no_lead_as_safe: bool = False,
+):
+    """Return a PNG safety index distribution histogram for a single speed bucket."""
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
+
+    by_bucket = _collect_safety_data(directory, no_lead_as_safe=no_lead_as_safe)
+    values = by_bucket.get(speed_bucket)
+    if not values:
+        raise HTTPException(404, f"No data for speed bucket {speed_bucket}")
+
+    png = _render_safety_index_distribution_chart(values, speed_bucket)
     return Response(
         content=png,
         media_type="image/png",
