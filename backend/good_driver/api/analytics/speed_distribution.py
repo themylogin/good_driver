@@ -72,7 +72,8 @@ def _render_speed_distribution_chart(speeds: list[float], speed_limit: int) -> b
             x_value = rect.get_x() + rect.get_width() / 2
             if y_value == 0:
                 continue
-            label = "%.2g%%" % (y_value / total * 100,)
+            pct = y_value / total * 100
+            label = f"{pct:.0f}%" if pct == int(pct) else f"{pct:.1f}%"
             ax.annotate(
                 label,
                 (x_value, y_value),
@@ -107,6 +108,80 @@ async def speed_distribution(directory: str):
     return {"limits": limits}
 
 
+def _render_speed_distribution_cumulative_chart(speeds: list[float], speed_limit: int) -> bytes:
+    """Render a cumulative speed distribution bar chart as PNG bytes."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mplcyberpunk
+
+    bin_size = 10
+    min_bucket = max(0, (speed_limit - 40) // bin_size * bin_size)
+    max_bucket = speed_limit + 80
+    bins = list(range(min_bucket, max_bucket + bin_size, bin_size))
+
+    labels = [f"{b}+" for b in bins[:-1]]
+
+    total = len(speeds)
+    counts = [0] * len(labels)
+    for i, b in enumerate(bins[:-1]):
+        counts[i] = sum(1 for s in speeds if s > b)
+
+    def _fmt_duration(seconds: int) -> str:
+        days, remainder = divmod(int(seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if not parts:
+            parts.append(f"{int(seconds)}s")
+        return " ".join(parts)
+
+    with plt.style.context("cyberpunk"):
+        fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+
+        ax.bar(range(len(labels)), counts)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels)
+
+        ax.set_title(
+            f"Cumulative Speed Distribution at {speed_limit} Km/h Limit (Total Travel Time: {_fmt_duration(total)})",
+            fontsize=20,
+        )
+        ax.xaxis.set_label_text("")
+        ax.yaxis.set_major_formatter(lambda x, _pos: _fmt_duration(x))
+
+        for rect in ax.patches:
+            y_value = rect.get_height()
+            x_value = rect.get_x() + rect.get_width() / 2
+            if y_value == 0:
+                continue
+            pct = y_value / total * 100
+            label = f"{pct:.0f}%" if pct == int(pct) else f"{pct:.1f}%"
+            ax.annotate(
+                label,
+                (x_value, y_value),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+            )
+
+        mplcyberpunk.add_glow_effects(ax)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+
 @router.get("/speed-distribution-chart")
 async def speed_distribution_chart(directory: str, speed_limit: int):
     """Return a PNG speed distribution chart for the given speed limit."""
@@ -120,6 +195,26 @@ async def speed_distribution_chart(directory: str, speed_limit: int):
         raise HTTPException(404, f"No data for speed limit {speed_limit}")
 
     png = _render_speed_distribution_chart(speeds, speed_limit)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/speed-distribution-cumulative-chart")
+async def speed_distribution_cumulative_chart(directory: str, speed_limit: int):
+    """Return a PNG cumulative speed distribution chart for the given speed limit."""
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
+
+    by_limit = _collect_speed_data(directory)
+    speeds = by_limit.get(speed_limit)
+    if not speeds:
+        raise HTTPException(404, f"No data for speed limit {speed_limit}")
+
+    png = _render_speed_distribution_cumulative_chart(speeds, speed_limit)
     return Response(
         content=png,
         media_type="image/png",

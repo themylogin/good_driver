@@ -1,11 +1,13 @@
 import { useState } from "react";
 import SpeedDistribution from "./analytics/SpeedDistribution";
+import SpeedDistributionCumulative from "./analytics/SpeedDistributionCumulative";
 import TopSpeeding from "./analytics/TopSpeeding";
 
-type AnalyticsTab = "speed-distribution" | "top-speeding";
+type AnalyticsTab = "speed-distribution" | "speed-distribution-cumulative" | "top-speeding";
 
 const TABS: { id: AnalyticsTab; label: string }[] = [
   { id: "speed-distribution", label: "Speed Distribution" },
+  { id: "speed-distribution-cumulative", label: "Speed Distribution (Cumulative)" },
   { id: "top-speeding", label: "Top Speeding" },
 ];
 
@@ -43,6 +45,7 @@ export default function Analytics({ directory, onNavigateToVideo }: AnalyticsPro
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "1rem" }}>
         {activeTab === "speed-distribution" && <SpeedDistribution directory={directory} />}
+        {activeTab === "speed-distribution-cumulative" && <SpeedDistributionCumulative directory={directory} />}
         {activeTab === "top-speeding" && <TopSpeeding directory={directory} onNavigateToVideo={onNavigateToVideo} />}
       </div>
     </div>
