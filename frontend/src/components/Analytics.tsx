@@ -4,8 +4,9 @@ import SafetyIndexCumulative from "./analytics/SafetyIndexCumulative";
 import SpeedDistribution from "./analytics/SpeedDistribution";
 import SpeedDistributionCumulative from "./analytics/SpeedDistributionCumulative";
 import TopSpeeding from "./analytics/TopSpeeding";
+import TopTailgating from "./analytics/TopTailgating";
 
-type AnalyticsTab = "speed-distribution" | "speed-distribution-cumulative" | "top-speeding" | "safety-index" | "safety-index-cumulative";
+type AnalyticsTab = "speed-distribution" | "speed-distribution-cumulative" | "top-speeding" | "top-tailgating" | "safety-index" | "safety-index-cumulative";
 
 const TABS: { id: AnalyticsTab; label: string }[] = [
   { id: "speed-distribution", label: "Speed Distribution" },
@@ -13,6 +14,7 @@ const TABS: { id: AnalyticsTab; label: string }[] = [
   { id: "top-speeding", label: "Top Speeding" },
   { id: "safety-index", label: "Safety Index" },
   { id: "safety-index-cumulative", label: "Safety Index (Cumulative)" },
+  { id: "top-tailgating", label: "Top Tailgating" },
 ];
 
 interface AnalyticsProps {
@@ -53,6 +55,7 @@ export default function Analytics({ directory, onNavigateToVideo }: AnalyticsPro
         {activeTab === "top-speeding" && <TopSpeeding directory={directory} onNavigateToVideo={onNavigateToVideo} />}
         {activeTab === "safety-index" && <SafetyIndex directory={directory} />}
         {activeTab === "safety-index-cumulative" && <SafetyIndexCumulative directory={directory} />}
+        {activeTab === "top-tailgating" && <TopTailgating directory={directory} onNavigateToVideo={onNavigateToVideo} />}
       </div>
     </div>
   );

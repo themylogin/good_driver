@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
 from ...physics import safety_index
-from .common import VIDEO_EXTENSIONS, _data_dir
+from .common import VIDEO_EXTENSIONS, _data_dir, _dist_for_second, _get_fps
 
 router = APIRouter()
 
@@ -39,15 +39,16 @@ def _collect_safety_data(directory: str, *, no_lead_as_safe: bool = False) -> di
             continue
         gps_data = json.loads(gzip.decompress(gps_path.read_bytes()))
         dist_data = json.loads(gzip.decompress(dist_path.read_bytes()))
-        for i in range(len(dist_data)):
-            gps = gps_data[i] if i < len(gps_data) else None
+        fps = _get_fps(ddir)
+        for i in range(len(gps_data)):
+            gps = gps_data[i]
             if gps is None:
                 continue
             speed = gps.get("speed_kmh")
             if speed is None or speed < MIN_SPEED:
                 continue
 
-            dist_entry = dist_data[i]
+            dist_entry = _dist_for_second(dist_data, i, fps)
             has_distance = dist_entry is not None and dist_entry.get("distance") is not None
             if has_distance:
                 si = safety_index(dist_entry["distance"], speed)
