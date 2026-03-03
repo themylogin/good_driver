@@ -1,14 +1,16 @@
 import { useState } from "react";
+import SafetyIndex from "./analytics/SafetyIndex";
 import SpeedDistribution from "./analytics/SpeedDistribution";
 import SpeedDistributionCumulative from "./analytics/SpeedDistributionCumulative";
 import TopSpeeding from "./analytics/TopSpeeding";
 
-type AnalyticsTab = "speed-distribution" | "speed-distribution-cumulative" | "top-speeding";
+type AnalyticsTab = "speed-distribution" | "speed-distribution-cumulative" | "top-speeding" | "safety-index";
 
 const TABS: { id: AnalyticsTab; label: string }[] = [
   { id: "speed-distribution", label: "Speed Distribution" },
   { id: "speed-distribution-cumulative", label: "Speed Distribution (Cumulative)" },
   { id: "top-speeding", label: "Top Speeding" },
+  { id: "safety-index", label: "Safety Index" },
 ];
 
 interface AnalyticsProps {
@@ -47,6 +49,7 @@ export default function Analytics({ directory, onNavigateToVideo }: AnalyticsPro
         {activeTab === "speed-distribution" && <SpeedDistribution directory={directory} />}
         {activeTab === "speed-distribution-cumulative" && <SpeedDistributionCumulative directory={directory} />}
         {activeTab === "top-speeding" && <TopSpeeding directory={directory} onNavigateToVideo={onNavigateToVideo} />}
+        {activeTab === "safety-index" && <SafetyIndex directory={directory} />}
       </div>
     </div>
   );
