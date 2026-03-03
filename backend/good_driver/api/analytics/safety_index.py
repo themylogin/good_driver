@@ -214,6 +214,77 @@ def _render_safety_index_distribution_chart(values: list[float], speed_bucket: i
         return buf.read()
 
 
+def _render_safety_index_cumulative_chart(values: list[float], speed_bucket: int) -> bytes:
+    """Render a cumulative safety index distribution chart for a single speed bucket."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import mplcyberpunk
+    import numpy as np
+
+    total = len(values)
+
+    def _fmt_duration(seconds: int) -> str:
+        days, remainder = divmod(int(seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if not parts:
+            parts.append(f"{int(seconds)}s")
+        return " ".join(parts)
+
+    thresholds = list(np.arange(0, 1.0, 0.1)) + [1.0]
+    labels = [f"{t:.1f}+" for t in thresholds]
+
+    counts = [sum(1 for v in values if v >= t) for t in thresholds]
+
+    with plt.style.context("cyberpunk"):
+        fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+
+        ax.bar(range(len(labels)), counts)
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels)
+        ax.set_xlabel("Safety Index")
+        ax.yaxis.set_major_formatter(lambda x, _pos: _fmt_duration(x))
+
+        ax.set_title(
+            f"Cumulative Safety Index at {speed_bucket}\u2013{speed_bucket + BIN_SIZE} km/h "
+            f"(Total: {_fmt_duration(total)})",
+            fontsize=20,
+        )
+
+        for rect in ax.patches:
+            y_value = rect.get_height()
+            x_value = rect.get_x() + rect.get_width() / 2
+            if y_value == 0:
+                continue
+            pct = y_value / total * 100
+            label = f"{pct:.0f}%" if pct == int(pct) else f"{pct:.1f}%"
+            ax.annotate(
+                label,
+                (x_value, y_value),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+            )
+
+        mplcyberpunk.add_glow_effects(ax)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+
 @router.get("/safety-index-chart")
 async def safety_index_chart(directory: str, no_lead_as_safe: bool = False):
     """Return a PNG safety index chart grouped by driving speed."""
@@ -263,6 +334,28 @@ async def safety_index_distribution_chart(
         raise HTTPException(404, f"No data for speed bucket {speed_bucket}")
 
     png = _render_safety_index_distribution_chart(values, speed_bucket)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/safety-index-cumulative-chart")
+async def safety_index_cumulative_chart(
+    directory: str, speed_bucket: int, no_lead_as_safe: bool = False,
+):
+    """Return a PNG cumulative safety index chart for a single speed bucket."""
+    data_dir = Path(directory)
+    if not data_dir.exists():
+        raise HTTPException(404, f"Directory not found: {data_dir}")
+
+    by_bucket = _collect_safety_data(directory, no_lead_as_safe=no_lead_as_safe)
+    values = by_bucket.get(speed_bucket)
+    if not values:
+        raise HTTPException(404, f"No data for speed bucket {speed_bucket}")
+
+    png = _render_safety_index_cumulative_chart(values, speed_bucket)
     return Response(
         content=png,
         media_type="image/png",
