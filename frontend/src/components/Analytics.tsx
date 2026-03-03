@@ -5,8 +5,8 @@ import TopSpeeding from "./analytics/TopSpeeding";
 type AnalyticsTab = "speed-distribution" | "top-speeding";
 
 const TABS: { id: AnalyticsTab; label: string }[] = [
-  { id: "speed-distribution", label: "Speed distribution" },
-  { id: "top-speeding", label: "Top speeding" },
+  { id: "speed-distribution", label: "Speed Distribution" },
+  { id: "top-speeding", label: "Top Speeding" },
 ];
 
 interface AnalyticsProps {
