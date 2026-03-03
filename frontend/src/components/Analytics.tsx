@@ -1,46 +1,13 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import SpeedDistribution from "./analytics/SpeedDistribution";
+import TopSpeeding from "./analytics/TopSpeeding";
 
-interface SpeedLimit {
-  speed_limit: number;
-  count: number;
-}
+type AnalyticsTab = "speed-distribution" | "top-speeding";
 
-interface SpeedingSection {
-  avg_speed_kmh: number;
-  location: string;
-  date: string;
-  start_lat: number;
-  start_lon: number;
-  video: string;
-  second: number;
-}
-
-interface SpeedingTable {
-  window_seconds: number;
-  window_label: string;
-  sections: SpeedingSection[];
-}
-
-interface TopSpeedingGroup {
-  speed_limit: number;
-  tables: SpeedingTable[];
-}
-
-interface TopSpeedingData {
-  groups: TopSpeedingGroup[];
-}
-
-const thStyle: React.CSSProperties = {
-  textAlign: "left",
-  padding: "0.5rem 1rem",
-  borderBottom: "2px solid #ddd",
-  fontWeight: 600,
-};
-
-const tdStyle: React.CSSProperties = {
-  padding: "0.4rem 1rem",
-  borderBottom: "1px solid #eee",
-};
+const TABS: { id: AnalyticsTab; label: string }[] = [
+  { id: "speed-distribution", label: "Speed distribution" },
+  { id: "top-speeding", label: "Top speeding" },
+];
 
 interface AnalyticsProps {
   directory: string;
@@ -48,119 +15,36 @@ interface AnalyticsProps {
 }
 
 export default function Analytics({ directory, onNavigateToVideo }: AnalyticsProps) {
-  const [limits, setLimits] = useState<SpeedLimit[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const [speedingGroups, setSpeedingGroups] = useState<TopSpeedingGroup[]>([]);
-  const [speedingLoading, setSpeedingLoading] = useState(true);
-  const [speedingError, setSpeedingError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    fetch(`/api/analytics/speed-distribution?directory=${encodeURIComponent(directory)}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(r.statusText);
-        return r.json();
-      })
-      .then((data) => setLimits(data.limits))
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
-  }, [directory]);
-
-  useEffect(() => {
-    setSpeedingLoading(true);
-    setSpeedingError(null);
-    fetch(`/api/analytics/top-speeding-sections?directory=${encodeURIComponent(directory)}`)
-      .then((r) => {
-        if (!r.ok) throw new Error(r.statusText);
-        return r.json();
-      })
-      .then((data: TopSpeedingData) => setSpeedingGroups(data.groups))
-      .catch((e) => setSpeedingError(String(e)))
-      .finally(() => setSpeedingLoading(false));
-  }, [directory]);
-
-  if (loading) return <div style={{ padding: "2rem", color: "#888" }}>Loading...</div>;
-  if (error) return <div style={{ padding: "2rem", color: "#cc0000" }}>{error}</div>;
-  if (limits.length === 0)
-    return <div style={{ padding: "2rem", color: "#888" }}>No speed distribution data available. Process some videos with GPS and snap-to-road first.</div>;
+  const [activeTab, setActiveTab] = useState<AnalyticsTab>("speed-distribution");
 
   return (
-    <div style={{ padding: "1rem", overflowY: "auto", height: "100%" }}>
-      {limits.map((l) => (
-        <div key={l.speed_limit} style={{ marginBottom: "1rem" }}>
-          <img
-            src={`/api/analytics/speed-distribution-chart?directory=${encodeURIComponent(directory)}&speed_limit=${l.speed_limit}`}
-            alt={`Speed distribution for ${l.speed_limit} km/h limit`}
-            style={{ width: "100%", maxWidth: 1920 }}
-          />
-        </div>
-      ))}
-
-      {speedingLoading && (
-        <div style={{ padding: "1rem", color: "#888" }}>Loading speeding sections...</div>
-      )}
-      {speedingError && (
-        <div style={{ padding: "1rem", color: "#cc0000" }}>{speedingError}</div>
-      )}
-      {speedingGroups.map((group) => (
-        <div key={group.speed_limit} style={{ padding: "1rem 0" }}>
-          <h2 style={{ marginBottom: "1rem" }}>
-            Top speeding sections (speed limit: {group.speed_limit} km/h)
-          </h2>
-          {group.tables.map((table) => (
-            <div key={table.window_seconds} style={{ marginBottom: "2rem" }}>
-              <h3 style={{ marginBottom: "0.5rem" }}>{table.window_label}</h3>
-              {table.sections.length === 0 ? (
-                <div style={{ color: "#888" }}>No data for this window duration.</div>
-              ) : (
-                <table style={{ borderCollapse: "collapse", width: "100%" }}>
-                  <thead>
-                    <tr>
-                      <th style={thStyle}>#</th>
-                      <th style={thStyle}>Avg speed (km/h)</th>
-                      <th style={thStyle}>Date</th>
-                      <th style={thStyle}>Location</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {table.sections.map((section, idx) => (
-                      <tr key={idx}>
-                        <td style={tdStyle}>{idx + 1}</td>
-                        <td style={tdStyle}>{section.avg_speed_kmh}</td>
-                        <td style={tdStyle}>
-                          <a
-                            href="#"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              onNavigateToVideo?.(section.video, section.second);
-                            }}
-                            style={{ color: "#0066cc", textDecoration: "none" }}
-                          >
-                            {section.date}
-                          </a>
-                        </td>
-                        <td style={tdStyle}>
-                          <a
-                            href={`https://www.google.com/maps?q=${section.start_lat},${section.start_lon}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={{ color: "#0066cc", textDecoration: "none" }}
-                          >
-                            {section.location}
-                          </a>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          ))}
-        </div>
-      ))}
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <div style={{ display: "flex", borderBottom: "1px solid #ddd", flexShrink: 0 }}>
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              padding: "0.5rem 1rem",
+              border: "none",
+              borderBottom: activeTab === tab.id ? "2px solid #0066cc" : "2px solid transparent",
+              marginBottom: "-1px",
+              background: "none",
+              cursor: "pointer",
+              fontFamily: "system-ui",
+              fontSize: "0.85rem",
+              color: activeTab === tab.id ? "#0066cc" : "#555",
+              fontWeight: activeTab === tab.id ? 600 : 400,
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "1rem" }}>
+        {activeTab === "speed-distribution" && <SpeedDistribution directory={directory} />}
+        {activeTab === "top-speeding" && <TopSpeeding directory={directory} onNavigateToVideo={onNavigateToVideo} />}
+      </div>
     </div>
   );
 }
