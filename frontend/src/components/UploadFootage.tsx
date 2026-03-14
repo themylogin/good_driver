@@ -156,10 +156,10 @@ export default function UploadFootage({ directory, navigateToVideo, onNavigated 
   const navSeekRef = useRef<number | null>(navigateToVideo?.second ?? null);
 
   // ── Fetch metadata for all videos ──────────────────────────────────────
-  const fetchAllMeta = useCallback(async (videoList: VideoEntry[]) => {
+  const fetchAllMeta = useCallback(async (videoList: VideoEntry[], signal?: AbortSignal) => {
     const entries = await Promise.all(
       videoList.map(async (v) => {
-        const r = await fetch(`/api/footage/metadata?filename=${encodeURIComponent(v.filename)}&directory=${encodeURIComponent(directory)}`);
+        const r = await fetch(`/api/footage/metadata?filename=${encodeURIComponent(v.filename)}&directory=${encodeURIComponent(directory)}`, { signal });
         const data = r.ok ? await r.json() : null;
         return [v.filename, data] as [string, VideoMeta];
       }),
@@ -235,8 +235,22 @@ export default function UploadFootage({ directory, navigateToVideo, onNavigated 
   }, [allComplete]);
   useEffect(() => {
     if (!processingStarted || videos.length === 0) return;
-    const id = setInterval(() => fetchAllMeta(videos), 1000);
-    return () => clearInterval(id);
+    let active = true;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        await fetchAllMeta(videos, controller.signal);
+      } catch {
+        // AbortError or network error — ignore
+      }
+      if (active) setTimeout(poll, 1000);
+    };
+    const id = setTimeout(poll, 1000);
+    return () => {
+      active = false;
+      clearTimeout(id);
+      controller.abort();
+    };
   }, [processingStarted, videos, fetchAllMeta]);
 
   // ── Update overlay URL for the given time ──────────────────────────────
