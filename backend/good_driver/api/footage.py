@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 import logging
+import random
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1508,7 +1510,7 @@ def _find_ego_lane_lead(
     """Find the lead car using ego-lane proximity criteria and compute hGP distance.
 
     Criteria (thresholds in model pixels):
-      1. Non-discarded ego lane pixels within 5 px below bbox bottom
+      1. Non-discarded ego lane pixels within 6 px below bbox bottom
       2. Ego lane pixels within 10 px left of left edge OR right of right edge
       3. 90% of bbox height is above some ego lane pixel (ego pixels in bottom 10% of bbox)
 
@@ -1519,7 +1521,7 @@ def _find_ego_lane_lead(
 
     sy = orig_h / _INPUT_H
     sx = orig_w / _INPUT_W
-    below_thresh = int(round(5 * sy))
+    below_thresh = int(round(6 * sy))
     side_thresh = int(round(10 * sx))
 
     candidates: list[tuple[dict, float]] = []
@@ -1737,6 +1739,53 @@ def _render_overlay_png(
     return png.tobytes()
 
 
+def _render_lane_overlay(frame_bgr: np.ndarray) -> bytes:
+    """Render raw lane/driveable masks on a BGR frame and return JPEG bytes."""
+    orig_h, orig_w = frame_bgr.shape[:2]
+
+    session = _get_session()
+    img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    tensor, sx, sy = _preprocess(img)
+    outputs = session.run(None, {session.get_inputs()[0].name: tensor})
+
+    masks_result = _extract_masks(outputs)
+    if masks_result is None:
+        _, jpeg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return jpeg.tobytes()
+
+    da_mask, lane_mask_model = masks_result
+
+    # Resize raw masks to original resolution — no discarding/cropping
+    da_full = cv2.resize(da_mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) > 0
+    ll_full = cv2.resize(lane_mask_model, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) > 0
+
+    # Split driveable area into lanes (for ego vs other coloring)
+    lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
+        da_mask, lane_mask_model, orig_w, orig_h)
+
+    alpha = int(0.4 * 255)
+    overlay_bgra = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
+    # Draw raw driveable area first as base
+    overlay_bgra[da_full] = [0, 255, 0, alpha]
+    # Color non-ego lanes on top
+    if ego_idx is not None:
+        for i, lm in enumerate(lane_masks):
+            if i != ego_idx and lm.any():
+                overlay_bgra[lm] = [255, 100, 0, alpha]
+    # Lane separators on top
+    overlay_bgra[ll_full] = [0, 0, 255, alpha]
+
+    # Composite
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    overlay_alpha = overlay_bgra[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_rgb = overlay_bgra[:, :, :3][:, :, ::-1].astype(np.float32)
+    composited = frame_rgb * (1 - overlay_alpha) + overlay_rgb * overlay_alpha
+    result_bgr = cv2.cvtColor(composited.astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+    _, jpeg = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return jpeg.tobytes()
+
+
 def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
     """Render debug overlay on a BGR frame and return JPEG bytes."""
     orig_h, orig_w = frame_bgr.shape[:2]
@@ -1941,3 +1990,281 @@ async def start_processing(directory: str):
         started.append(filename)
 
     return {"started": started}
+
+
+# ---------------------------------------------------------------------------
+# Training dataset endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/dataset-images")
+async def list_dataset_images(directory: str):
+    """List images in the Dataset subdirectory."""
+    dataset_dir = Path(directory) / "Dataset"
+    if not dataset_dir.is_dir():
+        return {"images": []}
+    images = sorted(
+        f.name for f in dataset_dir.iterdir()
+        if f.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    return {"images": images}
+
+
+@router.get("/dataset-image")
+async def get_dataset_image(filename: str, directory: str):
+    """Serve a saved dataset image."""
+    path = Path(directory) / "Dataset" / filename
+    if not path.exists():
+        raise HTTPException(404, f"Image not found: {path}")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.post("/dataset-random-frame")
+async def dataset_random_frame(directory: str):
+    """Pick a random video frame that contains car detections."""
+    data_dir = Path(directory)
+    videos = [
+        f for f in data_dir.iterdir()
+        if f.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    if not videos:
+        raise HTTPException(404, "No video files found")
+
+    session = _get_session()
+    max_attempts = 50
+
+    for _ in range(max_attempts):
+        video_path = random.choice(videos)
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            continue
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames < 1:
+                continue
+            frame_idx = random.randint(0, total_frames - 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame_bgr = cap.read()
+            if not ok:
+                continue
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            cap.release()
+
+        result = _infer_frame(frame_bgr, orig_w, orig_h, session)
+        detections = result.get("detections", [])
+        if not detections:
+            continue
+
+        # Render lane mask overlay
+        debug_jpeg = _render_lane_overlay(frame_bgr)
+
+        return {
+            "image_base64": base64.b64encode(debug_jpeg).decode(),
+            "video_filename": video_path.name,
+            "frame_number": frame_idx,
+            "width": orig_w,
+            "height": orig_h,
+            "detections": [
+                {"x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"]}
+                for d in detections
+            ],
+        }
+
+    raise HTTPException(500, "Could not find a frame with cars after multiple attempts")
+
+
+@router.post("/dataset-save")
+async def dataset_save(
+    directory: str,
+    video_filename: str,
+    frame_number: int,
+    bbox_x1: int | None = None,
+    bbox_y1: int | None = None,
+    bbox_x2: int | None = None,
+    bbox_y2: int | None = None,
+    rear_center_x: int | None = None,
+):
+    """Save an annotated training image and its JSON label."""
+    data_dir = Path(directory)
+    dataset_dir = data_dir / "Dataset"
+    dataset_dir.mkdir(exist_ok=True)
+
+    # Re-extract the frame from video
+    video_path = data_dir / video_filename
+    if not video_path.exists():
+        raise HTTPException(404, f"Video not found: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise HTTPException(500, f"Cannot open video: {video_path}")
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ok, frame_bgr = cap.read()
+        if not ok:
+            raise HTTPException(400, f"Cannot read frame {frame_number}")
+    finally:
+        cap.release()
+
+    stem = f"{video_filename}_{frame_number}"
+    image_name = f"{stem}.jpg"
+    json_name = f"{image_name}.json"
+
+    cv2.imwrite(str(dataset_dir / image_name), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    if bbox_x1 is not None:
+        label = {
+            "video_filename": video_filename,
+            "frame_number": frame_number,
+            "bbox": {"x1": bbox_x1, "y1": bbox_y1, "x2": bbox_x2, "y2": bbox_y2},
+            "rear_center_x": rear_center_x,
+        }
+    else:
+        label = {
+            "video_filename": video_filename,
+            "frame_number": frame_number,
+            "leading_car": False,
+        }
+    (dataset_dir / json_name).write_text(json.dumps(label, indent=2))
+
+    return {"filename": image_name}
+
+
+@router.get("/dataset-stats")
+async def dataset_stats(directory: str):
+    """Return counts of frames with/without a leading car in Dataset/."""
+    dataset_dir = Path(directory) / "Dataset"
+    with_car = 0
+    without_car = 0
+    if dataset_dir.is_dir():
+        for f in dataset_dir.iterdir():
+            if f.suffix.lower() != ".json":
+                continue
+            try:
+                data = json.loads(f.read_text())
+                if data.get("leading_car") is False:
+                    without_car += 1
+                elif "bbox" in data:
+                    with_car += 1
+            except Exception:
+                continue
+    return {"with_car": with_car, "without_car": without_car}
+
+
+@router.get("/dataset-debug-image")
+async def dataset_debug_image(filename: str, directory: str):
+    """Run debug overlay on a dataset image (same as debug tab)."""
+    path = Path(directory) / "Dataset" / filename
+    if not path.exists():
+        raise HTTPException(404, f"Image not found: {path}")
+    frame_bgr = cv2.imread(str(path))
+    if frame_bgr is None:
+        raise HTTPException(500, f"Cannot read image: {path}")
+    jpeg_bytes = _render_debug(frame_bgr, Path(directory))
+    return Response(content=jpeg_bytes, media_type="image/jpeg")
+
+
+@router.post("/dataset-evaluate")
+async def dataset_evaluate(directory: str):
+    """Evaluate the training dataset: run lead detection on each labeled image
+    and compare with the human annotation."""
+    data_dir = Path(directory)
+    dataset_dir = data_dir / "Dataset"
+    if not dataset_dir.is_dir():
+        raise HTTPException(404, "No Dataset directory")
+
+    cam = _load_camera_params(data_dir)
+    session = _get_session()
+
+    results: list[dict] = []
+
+    for json_file in sorted(dataset_dir.iterdir()):
+        if json_file.suffix.lower() != ".json":
+            continue
+        try:
+            label = json.loads(json_file.read_text())
+        except Exception:
+            continue
+
+        image_file = dataset_dir / json_file.name.removesuffix(".json")
+        if not image_file.exists():
+            continue
+
+        frame_bgr = cv2.imread(str(image_file))
+        if frame_bgr is None:
+            continue
+        orig_h, orig_w = frame_bgr.shape[:2]
+
+        # Run inference
+        infer_result = _infer_frame(frame_bgr, orig_w, orig_h, session)
+        detections = infer_result.get("detections", [])
+        mask_payload = infer_result.get("mask")
+
+        # Find lead car using the same logic as _run_lead_step
+        lead_det = None
+        if mask_payload is not None and cam is not None:
+            classes_region = decode_mask(mask_payload)
+            classes_full = np.zeros((_INPUT_H, _INPUT_W), dtype=np.uint8)
+            start_row = mask_payload["start_row"]
+            classes_full[start_row:start_row + mask_payload["row_count"]] = classes_region
+
+            da_mask = ((classes_full == DRIVEABLE) | (classes_full == LANE_ON_DRIVEABLE)).astype(np.uint8)
+            lane_mask = ((classes_full == LANE_ON_DRIVEABLE) | (classes_full == LANE_NO_DRIVEABLE)).astype(np.uint8)
+
+            lane_masks, ego_idx, _ego_discarded = _build_lane_polygons(
+                da_mask, lane_mask, orig_w, orig_h)
+
+            if ego_idx is not None:
+                ego_mask = lane_masks[ego_idx]
+                ego_lead, _hgp_dist = _find_ego_lane_lead(
+                    detections, ego_mask, orig_w, orig_h, cam)
+                if ego_lead is not None:
+                    lead_det = ego_lead
+
+            if lead_det is None:
+                _cl_img, _cl_hinge, _cl_extrap, _raw_cl, cl_lead = _fit_centerline_and_lead(
+                    lane_masks, ego_idx, detections, orig_w, orig_h, cam)
+                if cl_lead is not None:
+                    lead_det = cl_lead
+
+        # Compare with label
+        has_labeled_car = "bbox" in label
+        has_detected_lead = lead_det is not None
+
+        entry: dict = {"image": image_file.name}
+
+        if not has_labeled_car and not has_detected_lead:
+            entry["match"] = True
+            entry["detail"] = "Both agree: no leading car"
+        elif not has_labeled_car and has_detected_lead:
+            entry["match"] = False
+            entry["detail"] = "Label: no car, Algorithm: found lead"
+        elif has_labeled_car and not has_detected_lead:
+            entry["match"] = False
+            entry["detail"] = "Label: has car, Algorithm: no lead found"
+        else:
+            # Both have a car — check bbox overlap (IoU)
+            lb = label["bbox"]
+            db = lead_det
+            ix1 = max(lb["x1"], db["x1"])
+            iy1 = max(lb["y1"], db["y1"])
+            ix2 = min(lb["x2"], db["x2"])
+            iy2 = min(lb["y2"], db["y2"])
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_l = (lb["x2"] - lb["x1"]) * (lb["y2"] - lb["y1"])
+            area_d = (db["x2"] - db["x1"]) * (db["y2"] - db["y1"])
+            union = area_l + area_d - inter
+            iou = inter / union if union > 0 else 0
+            entry["match"] = iou > 0.3
+            entry["detail"] = f"IoU={iou:.2f}" + ("" if iou > 0.3 else " (different car)")
+
+        results.append(entry)
+
+    matches = sum(1 for r in results if r["match"])
+    total = len(results)
+    return {
+        "total": total,
+        "matches": matches,
+        "mismatches": total - matches,
+        "results": results,
+    }

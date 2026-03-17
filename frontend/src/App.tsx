@@ -4,6 +4,7 @@ import UploadFootage from "./components/UploadFootage";
 import Analytics from "./components/Analytics";
 import Settings from "./components/Settings";
 import DebugImages from "./components/DebugImages";
+import TrainingDataset from "./components/TrainingDataset";
 
 export interface CameraParams {
   fx: number;
@@ -13,13 +14,14 @@ export interface CameraParams {
   image_height: number;
 }
 
-type Tab = "settings" | "calibrate" | "upload" | "analytics" | "debug";
+type Tab = "settings" | "calibrate" | "upload" | "analytics" | "dataset" | "debug";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "settings", label: "Settings" },
   { id: "calibrate", label: "Calibrate" },
   { id: "upload", label: "Process footage" },
   { id: "analytics", label: "Analytics" },
+  { id: "dataset", label: "Training dataset" },
 ];
 
 type StartupState = "checking" | "model-missing" | "ready";
@@ -395,6 +397,7 @@ export default function App() {
         {activeTab === "calibrate" && <Calibrate directory={directory} />}
         {activeTab === "upload" && cameraParams && <UploadFootage directory={directory!} cameraParams={cameraParams} navigateToVideo={videoNavRequest} onNavigated={() => setVideoNavRequest(null)} />}
         {activeTab === "analytics" && <Analytics directory={directory!} onNavigateToVideo={handleNavigateToVideo} />}
+        {activeTab === "dataset" && <TrainingDataset directory={directory!} />}
         {activeTab === "debug" && <DebugImages directory={directory!} />}
       </div>
     </div>
