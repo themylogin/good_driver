@@ -242,7 +242,7 @@ export default function TrainingDataset({ directory }: TrainingDatasetProps) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const { scale, offsetX, offsetY, displayW, displayH } = scaleRef.current;
+    const { scale: _scale, offsetX, offsetY, displayW, displayH } = scaleRef.current;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, offsetX, offsetY, displayW, displayH);
