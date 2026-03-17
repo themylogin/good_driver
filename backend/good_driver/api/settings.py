@@ -11,12 +11,14 @@ SETTINGS_FILENAME = "settings.json"
 DEFAULT_SETTINGS = {
     "osrm_url": "http://localhost:5000",
     "nominatim_url": "http://localhost:8080",
+    "bumper_to_camera_m": 0.0,
 }
 
 
 class Settings(BaseModel):
     osrm_url: str = "http://localhost:5000"
     nominatim_url: str = "http://localhost:8080"
+    bumper_to_camera_m: float = 0.0
 
 
 class CheckRequest(BaseModel):

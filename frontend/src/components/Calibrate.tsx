@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,11 +186,11 @@ async function apiSaveAnnotation(
   });
 }
 
-async function apiSolve(directory: string) {
+async function apiSolve(directory: string, bumperToCameraM: number) {
   const res = await fetch("/api/calibrate/solve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ directory }),
+    body: JSON.stringify({ directory, bumper_to_camera_m: bumperToCameraM }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -310,12 +310,13 @@ interface CalibrateProps {
 
 export default function Calibrate({ directory }: CalibrateProps) {
   const [state, dispatch] = useReducer(reducer, initialState);
+  const [bumperToCameraM, setBumperToCameraM] = useState("0");
   const imgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const annotationTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
   const solveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load images when directory is set
+  // Load images and settings when directory is set
   useEffect(() => {
     fetch(`/api/calibrate/images?directory=${encodeURIComponent(directory)}`)
       .then((r) => r.json())
@@ -337,6 +338,15 @@ export default function Calibrate({ directory }: CalibrateProps) {
         dispatch({ type: "SET_IMAGES", images });
       })
       .catch((e) => dispatch({ type: "SET_ERROR", message: String(e) }));
+
+    fetch(`/api/settings?directory=${encodeURIComponent(directory)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.bumper_to_camera_m != null) {
+          setBumperToCameraM(String(data.bumper_to_camera_m));
+        }
+      })
+      .catch(() => {});
   }, [directory]);
 
   // Auto-detect when switching to an image with no detections yet
@@ -363,8 +373,8 @@ export default function Calibrate({ directory }: CalibrateProps) {
 
   // Auto-solve: fire when annotation data changes
   const annotationFingerprint = useMemo(
-    () => state.images.map((img) => `${img.selectedDetectionId}|${img.carWidthM}|${img.distanceM}`).join(","),
-    [state.images],
+    () => state.images.map((img) => `${img.selectedDetectionId}|${img.carWidthM}|${img.distanceM}`).join(",") + `|btc:${bumperToCameraM}`,
+    [state.images, bumperToCameraM],
   );
 
   useEffect(() => {
@@ -387,7 +397,7 @@ export default function Calibrate({ directory }: CalibrateProps) {
       solveTimer.current = null;
       dispatch({ type: "SOLVE_START" });
       try {
-        const result = await apiSolve(directory);
+        const result = await apiSolve(directory, parseFloat(bumperToCameraM) || 0);
         dispatch({
           type: "SOLVE_SUCCESS",
           fovDeg: result.fov_degrees,
@@ -530,6 +540,34 @@ export default function Calibrate({ directory }: CalibrateProps) {
               <ImageSubtitle img={img} />
             </div>
           ))}
+        </div>
+
+        {/* Bumper to camera offset */}
+        <div style={{ borderTop: "1px solid #ddd", padding: "0.75rem", flexShrink: 0 }}>
+          <div style={{ fontSize: "0.7rem", fontWeight: 700, color: "#888", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: "0.4rem" }}>
+            Bumper to camera
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              value={bumperToCameraM}
+              onChange={(e) => setBumperToCameraM(e.target.value)}
+              onBlur={() => {
+                fetch(`/api/settings?directory=${encodeURIComponent(directory)}`)
+                  .then((r) => r.json())
+                  .then((cur) => fetch(`/api/settings?directory=${encodeURIComponent(directory)}`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ ...cur, bumper_to_camera_m: parseFloat(bumperToCameraM) || 0 }),
+                  }))
+                  .catch(() => {});
+              }}
+              style={{ width: "4rem", fontSize: "0.85rem", padding: "0.15rem 0.3rem" }}
+            />
+            <span style={{ fontSize: "0.82rem", color: "#666" }}>m</span>
+          </div>
         </div>
 
         {/* Camera parameters — always shown */}

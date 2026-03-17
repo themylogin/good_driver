@@ -247,9 +247,6 @@ def detect_cars(image_path: Path) -> tuple[list[dict], int, int]:
     input_name = session.get_inputs()[0].name
     outputs = session.run(None, {input_name: tensor})
 
-    # Determine output format by inspecting first detection-related output
-    # Format A: ≥5 outputs → [seg, ll, pred0, pred1, pred2] (raw predictions)
-    # Format B: detection output shape is [1, N, 6] (post-NMS)
     det_output = None
     for o in outputs:
         if isinstance(o, np.ndarray) and o.ndim == 3 and o.shape[-1] in (6, 7):
@@ -266,9 +263,10 @@ def detect_cars(image_path: Path) -> tuple[list[dict], int, int]:
         logger.warning("Unexpected YOLO output format. Shapes: %s", [o.shape for o in outputs])
         boxes = []
 
-    scaled = _scale_boxes(boxes, sx, sy)
+    boxes = _scale_boxes(boxes, sx, sy)
+
     detections = []
-    for i, b in enumerate(scaled):
+    for i, b in enumerate(boxes):
         x1 = max(0, int(b["x1"]))
         y1 = max(0, int(b["y1"]))
         x2 = min(orig_w, int(b["x2"]))
@@ -331,6 +329,7 @@ def solve_camera_params(
     measurements: list[dict],
     image_width: int,
     image_height: int,
+    bumper_to_camera_m: float = 0.0,
 ) -> dict:
     """
     Fit [fx, pitch, h_cam] from car bbox measurements.
@@ -339,38 +338,37 @@ def solve_camera_params(
     """
     cy = image_height / 2.0
 
-    def residuals(params: np.ndarray) -> np.ndarray:
-        fx, pitch, h_cam = params
+    # fx from width equations only (not influenced by base equations)
+    fx_values = [m["pw"] * m["distance_m"] / m["car_width_m"] for m in measurements]
+    fx = float(np.mean(fx_values))
+
+    # Fit pitch and h_cam from base equations with fx fixed, normalized residuals
+    def base_residuals(params: np.ndarray) -> np.ndarray:
+        pitch, h_cam = params
         res = []
         for m in measurements:
-            pw = m["pw"]
             y_base = m["y_base"]
             d = m["distance_m"]
-            cw = m["car_width_m"]
-            # Width equation
-            res.append(fx * cw / d - pw)
-            # Base equation
             angle = math.atan2(h_cam, d) - pitch
-            res.append(cy + fx * math.tan(angle) - y_base)
+            dy = abs(y_base - cy) + 1e-6
+            res.append((cy + fx * math.tan(angle) - y_base) / dy)
         return np.array(res, dtype=float)
 
-    m0 = measurements[0]
-    fx0 = max(100.0, m0["pw"] * m0["distance_m"] / m0["car_width_m"])
-
     result = least_squares(
-        residuals,
-        x0=[fx0, -0.05, 1.2],
-        bounds=([100, -0.7, 0.1], [10000, 0.7, 5.0]),
+        base_residuals,
+        x0=[-0.05, 1.2],
+        bounds=([-0.7, 0.1], [0.7, 5.0]),
         method="trf",
     )
-    fx, pitch, h_solved = result.x
+    pitch, h_solved = result.x
 
     fov_deg = 2.0 * math.degrees(math.atan(image_width / 2.0 / fx))
     pitch_deg = math.degrees(pitch)
 
     per_image = []
     for m in measurements:
-        d_est = fx * m["car_width_m"] / m["pw"] if m["pw"] > 0 else None
+        d_cam = fx * m["car_width_m"] / m["pw"] if m["pw"] > 0 else None
+        d_est = d_cam - bumper_to_camera_m if d_cam is not None else None
         per_image.append(
             {
                 "filename": m["filename"],
@@ -539,6 +537,7 @@ def _collect_measurements(directory: Path) -> list[dict]:
 
 class SolveRequest(BaseModel):
     directory: str
+    bumper_to_camera_m: float = 0.0
 
 
 @router.post("/solve")
@@ -552,9 +551,13 @@ async def solve(req: SolveRequest):
             f"Need at least 2 complete measurements, got {len(measurements)}",
         )
 
+    # Adjust distances: user measures bumper-to-bumper, camera is behind their front bumper
+    for m in measurements:
+        m["distance_m"] += req.bumper_to_camera_m
+
     image_width = measurements[0]["image_width"]
     image_height = measurements[0]["image_height"]
-    return solve_camera_params(measurements, image_width, image_height)
+    return solve_camera_params(measurements, image_width, image_height, req.bumper_to_camera_m)
 
 
 @router.get("/params")
