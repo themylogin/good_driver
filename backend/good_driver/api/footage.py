@@ -1512,7 +1512,8 @@ def _find_ego_lane_lead(
     Criteria (thresholds in model pixels):
       1. Non-discarded ego lane pixels within 6 px below bbox bottom
       2. Ego lane pixels within 10 px left of left edge OR right of right edge
-      3. 90% of bbox height is above some ego lane pixel (ego pixels in bottom 10% of bbox)
+      3. 90% of bbox columns have ego lane pixels in the strip just below the bbox
+      4. Bbox center is within 25% of ego lane width from the ego lane center
 
     Returns (detection, hgp_distance_m) or (None, None).
     """
@@ -1557,13 +1558,23 @@ def _find_ego_lane_lead(
         if not has_side:
             continue
 
-        # Condition 3: 90% of bbox columns have ego lane pixels somewhere below them
+        # Condition 3: 90% of bbox columns have ego lane pixels in the strip below
         bbox_cols = bx1 - bx0
         if bbox_cols <= 0:
             continue
-        ego_below = ego_mask[by0:, bx0:bx1]  # from bbox bottom to image bottom
+        ego_below = ego_mask[by0:by1, bx0:bx1]  # strip just below bbox
         cols_with_ego = int((ego_below.any(axis=0)).sum())
         if cols_with_ego / bbox_cols < 0.9:
+            continue
+
+        # Condition 4: bbox center within 25% of ego lane width from ego lane center
+        strip_full = ego_mask[by0:by1, :]
+        ego_cols = np.where(strip_full.any(axis=0))[0]
+        if len(ego_cols) == 0:
+            continue
+        ego_cx = (ego_cols[0] + ego_cols[-1]) / 2.0
+        ego_w = ego_cols[-1] - ego_cols[0]
+        if ego_w > 0 and abs((x1 + x2) / 2.0 - ego_cx) / ego_w > 0.25:
             continue
 
         # Compute hGP distance — discard if > 25m (fall back to centerline)
