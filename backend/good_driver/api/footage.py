@@ -546,6 +546,14 @@ def _run_inference_step(filename: str, directory: str, key: str) -> None:
         fpath.write_bytes(gzip.compress(json.dumps(batch).encode()))
 
     cap.release()
+
+    # OpenCV's CAP_PROP_FRAME_COUNT can overcount for truncated files;
+    # update metadata with the actual number of readable frames.
+    if frame_n != total:
+        logger.warning("Video %s: metadata total_frames=%d but only %d readable; updating",
+                        filename, total, frame_n)
+        _write_metadata(ddir, total_frames=frame_n)
+
     logger.info("Finished inference for %s (%d frames)", filename, frame_n)
 
 
@@ -586,6 +594,12 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
 
         # Process each frame in the batch
         offset = frame_n - batch_start
+        if offset >= len(frames):
+            # Incomplete batch (e.g. interrupted inference) — fill rest with nulls
+            batch_end = min(batch_start + 100, total)
+            result.extend([None] * (batch_end - frame_n))
+            frame_n = batch_end
+            continue
         for i in range(offset, len(frames)):
             frame_entry = frames[i]
             lead_entry: dict | None = None
