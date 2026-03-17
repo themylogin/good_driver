@@ -612,11 +612,11 @@ def _run_lead_step(filename: str, directory: str, key: str) -> None:
                         lead_entry = {"id": ego_lead["track_id"], "distance": round(hgp_dist, 1)}
 
                 if lead_entry is None:
-                    centerline_img, centerline_extrap, _raw_cl, cl_lead = _fit_centerline_and_lead(
+                    centerline_img, centerline_hinge_img, centerline_extrap, _raw_cl, cl_lead = _fit_centerline_and_lead(
                         lane_masks, ego_idx, detections, orig_w, orig_h, cam)
                     if cl_lead is not None:
                         hwc_result = _compute_hwc_distance(
-                            cl_lead, centerline_img, centerline_extrap, orig_w, cam)
+                            cl_lead, centerline_img, centerline_hinge_img, centerline_extrap, orig_w, cam)
                         if hwc_result is not None:
                             hwc_dist, _theta = hwc_result
                             lead_entry = {"id": cl_lead["track_id"], "distance": round(hwc_dist, 1)}
@@ -1246,12 +1246,14 @@ def _fit_centerline_and_lead(
     detections: list[dict],
     orig_w: int, orig_h: int,
     cam: dict | None,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], dict | None]:
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]], dict | None]:
     """Compute fitted centerline and identify lead car.
 
-    Returns (centerline_img, centerline_extrap, raw_centerline_img, lead_det).
+    Returns (centerline_img, centerline_hinge_img, centerline_extrap, raw_centerline_img, lead_det).
+    centerline_hinge_img contains points where the quadratic hinge term is active.
     """
     centerline_img: list[tuple[int, int]] = []
+    centerline_hinge_img: list[tuple[int, int]] = []
     centerline_extrap: list[tuple[int, int]] = []
     raw_centerline_img: list[tuple[int, int]] = []
     best_coeffs = None
@@ -1336,6 +1338,29 @@ def _fit_centerline_and_lead(
                     best_mode = "straight"
                     best_zb = 0.0
 
+                # Discard hinge if its active region covers <10 model-space rows
+                if best_mode in ("straight_then_curve", "curve_then_straight"):
+                    if best_mode == "straight_then_curve":
+                        z_hinge_start, z_hinge_end = best_zb, z_hi
+                    else:
+                        z_hinge_start, z_hinge_end = z_lo, best_zb
+                    uv_start = _world_to_image(0, z_hinge_start, _INPUT_W, _INPUT_H, cam)
+                    uv_end = _world_to_image(0, z_hinge_end, _INPUT_W, _INPUT_H, cam)
+                    if uv_start is not None and uv_end is not None:
+                        if abs(uv_start[1] - uv_end[1]) < 10:
+                            best_coeffs = straight_coeffs
+                            best_mode = "straight"
+                            best_zb = 0.0
+
+                def _hinge_active(z: float) -> bool:
+                    if best_mode == "straight":
+                        return False
+                    if best_mode == "curve":
+                        return True
+                    if best_mode == "straight_then_curve":
+                        return z > best_zb
+                    return z < best_zb  # curve_then_straight
+
                 for v in range(orig_h - 1, -1, -1):
                     w = _image_to_world(orig_w / 2, v, orig_w, orig_h, cam)
                     if w is None or w[1] <= 0:
@@ -1343,14 +1368,21 @@ def _fit_centerline_and_lead(
                     xw = _eval_hinge(w[1], best_coeffs, best_mode, best_zb)
                     uv = _world_to_image(float(xw), w[1], orig_w, orig_h, cam)
                     if uv and 0 <= uv[0] < orig_w and 0 <= uv[1] < orig_h:
-                        centerline_img.append((int(round(uv[0])), int(round(uv[1]))))
+                        pt = (int(round(uv[0])), int(round(uv[1])))
+                        if _hinge_active(w[1]):
+                            if not centerline_hinge_img and centerline_img:
+                                centerline_hinge_img.append(centerline_img[-1])
+                            centerline_hinge_img.append(pt)
+                        else:
+                            centerline_img.append(pt)
 
                 # Extrapolate past the horizon in image space
-                if len(centerline_img) >= 10:
-                    tail = np.array(centerline_img[-10:], dtype=np.float64)
+                all_fitted = [*centerline_img, *centerline_hinge_img]
+                if len(all_fitted) >= 10:
+                    tail = np.array(all_fitted[-10:], dtype=np.float64)
                     xs, ys = tail[:, 0], tail[:, 1]
                     coeffs = np.polyfit(ys, xs, 1)
-                    last_x, last_y = centerline_img[-1]
+                    last_x, last_y = all_fitted[-1]
                     centerline_extrap.append((last_x, last_y))  # overlap point
                     for ey in range(last_y - 1, -1, -1):
                         ex = int(round(coeffs[0] * ey + coeffs[1]))
@@ -1364,7 +1396,7 @@ def _fit_centerline_and_lead(
     bbox_extend_y = 0
     ego_mask = lane_masks[ego_idx] if ego_idx is not None and ego_idx < len(lane_masks) else None
     skip_dets: set[int] = set()
-    all_cl = [*centerline_img, *centerline_extrap]
+    all_cl = [*centerline_img, *centerline_hinge_img, *centerline_extrap]
     for ci, (cx_px, cy_px) in enumerate(all_cl):
         for di, det in enumerate(detections):
             if di in skip_dets:
@@ -1420,12 +1452,13 @@ def _fit_centerline_and_lead(
         if lead_det is not None:
             break
 
-    return centerline_img, centerline_extrap, raw_centerline_img, lead_det
+    return centerline_img, centerline_hinge_img, centerline_extrap, raw_centerline_img, lead_det
 
 
 def _compute_hwc_distance(
     lead_det: dict,
     centerline_img: list[tuple[int, int]],
+    centerline_hinge_img: list[tuple[int, int]],
     centerline_extrap: list[tuple[int, int]],
     orig_w: int,
     cam: dict,
@@ -1440,7 +1473,7 @@ def _compute_hwc_distance(
         return None
     hw_dist = 2.0 * fx_scaled / bbox_w_px
 
-    all_cl = [*centerline_img, *centerline_extrap]
+    all_cl = [*centerline_img, *centerline_hinge_img, *centerline_extrap]
     entry_idx = None
     for ci, (cpx, cpy) in enumerate(all_cl):
         if (lead_det["x1"] <= cpx <= lead_det["x2"]
@@ -1555,6 +1588,7 @@ def _draw_overlays(
     detections: list[dict],
     lead_det: dict | None,
     centerline_img: list[tuple[int, int]],
+    centerline_hinge_img: list[tuple[int, int]],
     centerline_extrap: list[tuple[int, int]],
     raw_centerline_img: list[tuple[int, int]],
     orig_w: int, orig_h: int,
@@ -1628,7 +1662,7 @@ def _draw_overlays(
                 hw_dist = 2.0 * fx_scaled / bbox_w_px
                 lines.append(f"hw: {hw_dist:.0f}m")
 
-                hwc_result = _compute_hwc_distance(lead_det, centerline_img, centerline_extrap, orig_w, cam)
+                hwc_result = _compute_hwc_distance(lead_det, centerline_img, centerline_hinge_img, centerline_extrap, orig_w, cam)
                 if hwc_result is not None:
                     hwc_dist, theta_deg = hwc_result
                     hwc_label = f"a: {theta_deg:.0f} hwc: {hwc_dist:.0f}m"
@@ -1661,6 +1695,9 @@ def _draw_overlays(
         if len(centerline_img) >= 2:
             pts_arr = np.array(centerline_img, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(canvas, [pts_arr], False, (0, 255, 255, 255), 2, cv2.LINE_AA)
+        if len(centerline_hinge_img) >= 2:
+            hinge_arr = np.array(centerline_hinge_img, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [hinge_arr], False, (3, 68, 103, 255), 2, cv2.LINE_AA)
         # Extrapolated centerline as dashes
         if len(centerline_extrap) >= 2:
             _DASH = 12
@@ -1683,7 +1720,7 @@ def _render_overlay_png(
     lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
         da_mask, lane_mask, orig_w, orig_h)
 
-    centerline_img, centerline_extrap, raw_centerline_img, cl_lead = _fit_centerline_and_lead(
+    centerline_img, centerline_hinge_img, centerline_extrap, raw_centerline_img, cl_lead = _fit_centerline_and_lead(
         lane_masks, ego_idx, detections, orig_w, orig_h, cam)
 
     ego_mask = lane_masks[ego_idx] if ego_idx is not None else np.zeros((orig_h, orig_w), dtype=bool)
@@ -1692,8 +1729,9 @@ def _render_overlay_png(
 
     canvas = np.zeros((orig_h, orig_w, 4), dtype=np.uint8)
     _draw_overlays(canvas, lane_masks, ego_idx, ego_discarded, lane_mask,
-                   detections, lead_det, centerline_img, centerline_extrap,
-                   raw_centerline_img, orig_w, orig_h, cam=cam, hgp_distance=hgp_dist)
+                   detections, lead_det, centerline_img, centerline_hinge_img,
+                   centerline_extrap, raw_centerline_img, orig_w, orig_h,
+                   cam=cam, hgp_distance=hgp_dist)
 
     _, png = cv2.imencode(".png", canvas)
     return png.tobytes()
@@ -1723,7 +1761,7 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
     lane_masks, ego_idx, ego_discarded = _build_lane_polygons(
         da_mask, lane_mask_model, orig_w, orig_h)
 
-    centerline_img, centerline_extrap, raw_centerline_img, cl_lead = _fit_centerline_and_lead(
+    centerline_img, centerline_hinge_img, centerline_extrap, raw_centerline_img, cl_lead = _fit_centerline_and_lead(
         lane_masks, ego_idx, detections, orig_w, orig_h, cam)
 
     ego_mask = lane_masks[ego_idx] if ego_idx is not None else np.zeros((orig_h, orig_w), dtype=bool)
@@ -1731,8 +1769,9 @@ def _render_debug(frame_bgr: np.ndarray, cam_directory: Path) -> bytes:
     lead_det = ego_lead if ego_lead is not None else cl_lead
 
     _draw_overlays(overlay_bgra, lane_masks, ego_idx, ego_discarded, lane_mask_model,
-                   detections, lead_det, centerline_img, centerline_extrap,
-                   raw_centerline_img, orig_w, orig_h, cam=cam, hgp_distance=hgp_dist)
+                   detections, lead_det, centerline_img, centerline_hinge_img,
+                   centerline_extrap, raw_centerline_img, orig_w, orig_h,
+                   cam=cam, hgp_distance=hgp_dist)
 
     # Composite BGRA overlay onto the video frame
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
