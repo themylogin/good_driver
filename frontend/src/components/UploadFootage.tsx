@@ -80,8 +80,11 @@ function isAllStepsComplete(meta: VideoMeta): boolean {
   });
 }
 
-function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta: VideoMeta; progressRef: React.RefObject<Record<string, ProgressSnapshot>> }) {
-  if (!meta || meta.total_frames === 0) {
+function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta: VideoMeta | null; progressRef: React.RefObject<Record<string, ProgressSnapshot>> }) {
+  if (meta === null) {
+    return <div style={{ color: "#aaa", fontSize: "0.78rem" }}>Loading...</div>;
+  }
+  if (meta.total_frames === 0) {
     return <div style={{ color: "#aaa", fontSize: "0.78rem" }}>Not processed</div>;
   }
   if (isAllStepsComplete(meta)) {
@@ -97,16 +100,25 @@ function VideoSubtitle({ filename, meta, progressRef }: { filename: string; meta
   const processed = meta.steps?.[currentStep]?.processed_frames ?? 0;
   const pct = Math.round((processed / meta.total_frames) * 100);
 
-  // Compute ETA from first observation of progress for current step
+  // Compute ETA from progress observations for current step
   let etaStr = "";
   const snap = progressRef.current?.[filename];
   if (snap && snap.step === currentStep && processed > snap.frames) {
     const elapsed = (Date.now() - snap.time) / 1000;
     const done = processed - snap.frames;
     const remaining = meta.total_frames - processed;
-    const rate = done / elapsed;
-    if (rate > 0) {
-      etaStr = `ETA ${formatEta(remaining / rate)}`;
+    // Require at least 5 seconds of data for a meaningful rate estimate;
+    // also periodically rebase the snapshot (every 60s) so the ETA
+    // adapts to changing processing speed instead of averaging from the start.
+    if (elapsed >= 5) {
+      const rate = done / elapsed;
+      if (rate > 0) {
+        etaStr = `ETA ${formatEta(remaining / rate)}`;
+      }
+      // Rebase snapshot every 60s so ETA reflects recent throughput
+      if (elapsed > 60) {
+        progressRef.current![filename] = { frames: processed, time: Date.now(), step: currentStep };
+      }
     }
   }
 
@@ -239,7 +251,24 @@ export default function UploadFootage({ directory, navigateToVideo, onNavigated 
     const controller = new AbortController();
     const poll = async () => {
       try {
-        await fetchAllMeta(videos, controller.signal);
+        // Only poll the first non-complete video instead of all videos
+        const target = videos.find((v) => !isAllStepsComplete(metas[v.filename]));
+        if (target) {
+          const r = await fetch(
+            `/api/footage/metadata?filename=${encodeURIComponent(target.filename)}&directory=${encodeURIComponent(directory)}`,
+            { signal: controller.signal },
+          );
+          const data = r.ok ? await r.json() : null;
+          setMetas((prev) => ({ ...prev, [target.filename]: data }));
+          // Seed / update ETA snapshot
+          if (data?.processing && data.current_step) {
+            const snap = progressSnapshots.current[target.filename];
+            const currentFrames = data.steps?.[data.current_step]?.processed_frames ?? 0;
+            if (!snap || snap.step !== data.current_step) {
+              progressSnapshots.current[target.filename] = { frames: currentFrames, time: Date.now(), step: data.current_step };
+            }
+          }
+        }
       } catch {
         // AbortError or network error — ignore
       }
@@ -251,7 +280,7 @@ export default function UploadFootage({ directory, navigateToVideo, onNavigated 
       clearTimeout(id);
       controller.abort();
     };
-  }, [processingStarted, videos, fetchAllMeta]);
+  }, [processingStarted, videos, metas, directory]);
 
   // ── Update overlay URL for the given time ──────────────────────────────
   const updateOverlay = useCallback((time: number) => {
